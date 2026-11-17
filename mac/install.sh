@@ -51,7 +51,9 @@ done
 
 # ------------------------------------------------------------------ downloads
 say "Downloading Lightpath…"
-curl -fsSL "$RAW/mac/lightpath?nocache=$(date +%s)" -o "$WORK/lightpath"
+# Through the API, not raw.githubusercontent.com: the raw CDN can serve a copy up to 5 minutes old.
+curl -fsSL -H "Accept: application/vnd.github.raw" "https://api.github.com/repos/$REPO/contents/mac/lightpath?ref=main" -o "$WORK/lightpath" \
+    || curl -fsSL "$RAW/mac/lightpath" -o "$WORK/lightpath"
 HAVE_TOOLS=1
 for f in awdl-guard lightpath-wake SHA256SUMS; do
     curl -fsSL "$REL/$f" -o "$WORK/$f" || HAVE_TOOLS=0
