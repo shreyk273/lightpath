@@ -286,7 +286,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         url = urllib.parse.urlparse(self.path)
         if not self._authorized():
             return
-        form = self._form()
+        form = self._form() if url.path != "/diag" else {}
         if url.path == "/pair":
             pin = str(form.get("pin", ""))
             name = str(form.get("name", "Mac"))[:64] or "Mac"
@@ -300,6 +300,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(502, {"error": f"sunshine: {e}"})
                 return
             self._json(200 if ok else 409, {"paired": ok})
+        elif url.path == "/diag":
+            # Diagnostics text from a Mac (e.g. its own ping log), kept for troubleshooting.
+            n = min(int(self.headers.get("Content-Length") or 0), 2 << 20)
+            body = self.rfile.read(n)
+            d = Path.home() / ".local/share/lightpath/diag"
+            d.mkdir(parents=True, exist_ok=True)
+            f = d / f"{time.strftime('%Y%m%d-%H%M%S')}-{self.client_address[0].replace(':', '_')}.txt"
+            f.write_bytes(body)
+            log(f"diagnostics from {self.client_address[0]}: {len(body)} bytes -> {f.name}")
+            self._json(200, {"saved": f.name})
         elif url.path == "/wake-intent":
             RUNTIME.mkdir(parents=True, exist_ok=True)
             INTENT_FILE.write_text(f"{int(time.time())} {self.client_address[0]}\n")
