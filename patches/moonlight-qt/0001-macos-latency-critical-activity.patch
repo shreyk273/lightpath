@@ -1,0 +1,121 @@
+From 7ac3d532723cc532d8a9de7dc6d17fc320dc2e14 Mon Sep 17 00:00:00 2001
+From: Shreyansh Kaushik <smkaushi@ucsc.edu>
+Date: Tue, 17 Nov 2026 00:27:23 -0800
+Subject: [PATCH] macOS: hold a latency-critical NSActivity while streaming
+
+---
+ app/app.pro                         |  4 +++-
+ app/streaming/session.cpp           |  5 +++++
+ app/streaming/streamactivity.h      | 11 ++++++++++
+ app/streaming/streamactivity_mac.mm | 31 +++++++++++++++++++++++++++++
+ 4 files changed, 50 insertions(+), 1 deletion(-)
+ create mode 100644 app/streaming/streamactivity.h
+ create mode 100644 app/streaming/streamactivity_mac.mm
+
+diff --git a/app/app.pro b/app/app.pro
+index 1c0661b..52abab5 100644
+--- a/app/app.pro
++++ b/app/app.pro
+@@ -229,6 +229,7 @@ HEADERS += \
+     settings/streamingpreferences.h \
+     streaming/input/input.h \
+     streaming/session.h \
++    streaming/streamactivity.h \
+     streaming/audio/renderers/renderer.h \
+     streaming/audio/renderers/sdl.h \
+     gui/computermodel.h \
+@@ -410,7 +411,8 @@ macx {
+     SOURCES += \
+         streaming/video/ffmpeg-renderers/vt_base.mm \
+         streaming/video/ffmpeg-renderers/vt_avsamplelayer.mm \
+-        streaming/video/ffmpeg-renderers/vt_metal.mm
++        streaming/video/ffmpeg-renderers/vt_metal.mm \
++        streaming/streamactivity_mac.mm
+ 
+     HEADERS += \
+         streaming/video/ffmpeg-renderers/vt.h
+diff --git a/app/streaming/session.cpp b/app/streaming/session.cpp
+index 75d30a1..b3fdfde 100644
+--- a/app/streaming/session.cpp
++++ b/app/streaming/session.cpp
+@@ -1,4 +1,5 @@
+ #include "session.h"
++#include "streamactivity.h"
+ #include "settings/streamingpreferences.h"
+ #include "streaming/streamutils.h"
+ #include "backend/richpresencemanager.h"
+@@ -1952,6 +1953,8 @@ void Session::exec()
+         SDL_DisableScreenSaver();
+     }
+ 
++    StreamActivity_Begin();
++
+     // Hide Qt's fake mouse cursor on EGLFS systems
+     if (QGuiApplication::platformName() == "eglfs") {
+         QGuiApplication::setOverrideCursor(QCursor(Qt::BlankCursor));
+@@ -2337,6 +2340,8 @@ DispatchDeferredCleanup:
+         QGuiApplication::restoreOverrideCursor();
+     }
+ 
++    StreamActivity_End();
++
+     // Raise any keys that are still down
+     m_InputHandler->raiseAllKeys();
+ 
+diff --git a/app/streaming/streamactivity.h b/app/streaming/streamactivity.h
+new file mode 100644
+index 0000000..7275789
+--- /dev/null
++++ b/app/streaming/streamactivity.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++// Lightpath: tell macOS a latency-critical stream is running so it never applies App Nap,
++// timer coalescing or idle sleep to Moonlight while frames are flowing.
++#ifdef __APPLE__
++void StreamActivity_Begin();
++void StreamActivity_End();
++#else
++static inline void StreamActivity_Begin() {}
++static inline void StreamActivity_End() {}
++#endif
+diff --git a/app/streaming/streamactivity_mac.mm b/app/streaming/streamactivity_mac.mm
+new file mode 100644
+index 0000000..2bd189e
+--- /dev/null
++++ b/app/streaming/streamactivity_mac.mm
+@@ -0,0 +1,31 @@
++#import <Foundation/Foundation.h>
++
++#include "streamactivity.h"
++
++static id<NSObject> s_StreamActivity = nil;
++
++void StreamActivity_Begin()
++{
++    if (s_StreamActivity != nil) {
++        return;
++    }
++
++    // NSActivityLatencyCritical disables timer coalescing for the process, which keeps the
++    // network, decode and present threads waking up exactly when they asked to.
++    s_StreamActivity = [[[NSProcessInfo processInfo]
++        beginActivityWithOptions:(NSActivityUserInitiated |
++                                  NSActivityLatencyCritical |
++                                  NSActivityIdleDisplaySleepDisabled)
++                          reason:@"Game streaming"] retain];
++}
++
++void StreamActivity_End()
++{
++    if (s_StreamActivity == nil) {
++        return;
++    }
++
++    [[NSProcessInfo processInfo] endActivity:s_StreamActivity];
++    [s_StreamActivity release];
++    s_StreamActivity = nil;
++}
+-- 
+2.56.0
+

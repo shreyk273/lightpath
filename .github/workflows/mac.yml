@@ -1,0 +1,121 @@
+name: Mac client
+
+# Builds Lightpath's Moonlight (upstream moonlight-qt + patches/moonlight-qt + patches/moonlight-common-c)
+# and the awdl-guard daemon, then publishes both to the rolling "mac-latest" release that
+# mac/install.sh downloads from.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/moonlight-qt/**'
+      - 'patches/moonlight-common-c/**'
+      - 'mac/awdl-guard/**'
+      - '.github/workflows/mac.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mac-client
+  cancel-in-progress: true
+
+jobs:
+  awdl-guard:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build (universal, ad-hoc signed)
+        run: |
+          clang -O2 -Wall -Wextra -Werror -arch arm64 -arch x86_64 -mmacosx-version-min=12.0 \
+            -o awdl-guard mac/awdl-guard/awdl-guard.c
+          codesign --force --sign - awdl-guard
+          lipo -info awdl-guard
+          ./awdl-guard --status
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: awdl-guard
+          path: awdl-guard
+          if-no-files-found: error
+
+  moonlight:
+    runs-on: macos-26
+    env:
+      QT_VERSION: 6.11.2
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch upstream Moonlight and apply Lightpath patches
+        run: |
+          set -euo pipefail
+          COMMIT="$(cat patches/moonlight-qt/UPSTREAM_COMMIT)"
+          git init -q moonlight-qt
+          cd moonlight-qt
+          git remote add origin https://github.com/moonlight-stream/moonlight-qt.git
+          git fetch -q --depth 1 origin "$COMMIT"
+          git checkout -q FETCH_HEAD
+          git submodule update -q --init --recursive --depth 1
+          GIT="git -c user.name=lightpath-ci -c user.email=ci@lightpath.invalid"
+          $GIT am ../patches/moonlight-qt/*.patch
+          (cd moonlight-common-c/moonlight-common-c && $GIT am ../../../patches/moonlight-common-c/*.patch)
+          echo "CI_VERSION=$(cat app/version.txt)-lightpath.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+
+      - name: Install create-dmg
+        run: |
+          brew install node
+          npm install --global create-dmg
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          cache: true
+          set-env: true
+          add-tools-to-path: true
+          version: ${{ env.QT_VERSION }}
+          aqtsource: 'git+https://github.com/miurahr/aqtinstall.git@073e34d7c2ab4ae6961ed7cca690b3abd5ba5a7e'
+
+      - name: Build universal app and DMG
+        working-directory: moonlight-qt
+        run: bash scripts/generate-dmg.sh Release
+
+      - name: Ad-hoc sign and verify
+        working-directory: moonlight-qt
+        run: |
+          DMG="$(ls build/installer-Release/*.dmg | head -1)"
+          cp "$DMG" ../Lightpath-Moonlight.dmg
+          hdiutil attach -nobrowse -readonly -mountpoint /tmp/ml ../Lightpath-Moonlight.dmg
+          codesign --verify --deep --verbose=2 /tmp/ml/Moonlight.app || true
+          lipo -info /tmp/ml/Moonlight.app/Contents/MacOS/Moonlight
+          hdiutil detach /tmp/ml
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: moonlight
+          path: Lightpath-Moonlight.dmg
+          compression-level: 0
+          if-no-files-found: error
+
+  release:
+    needs: [awdl-guard, moonlight]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish rolling release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          (cd dist && shasum -a 256 Lightpath-Moonlight.dmg awdl-guard > SHA256SUMS)
+          if ! gh release view mac-latest >/dev/null 2>&1; then
+            gh release create mac-latest --title "Mac client (latest build)" --notes "Built automatically from main by the Mac client workflow." --target "$GITHUB_SHA"
+          fi
+          gh release upload mac-latest dist/Lightpath-Moonlight.dmg dist/awdl-guard dist/SHA256SUMS --clobber
+          gh release edit mac-latest --notes "Built automatically from ${GITHUB_SHA::7} by run #${GITHUB_RUN_NUMBER}."

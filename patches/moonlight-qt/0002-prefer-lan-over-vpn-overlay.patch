@@ -1,0 +1,84 @@
+From 16f4f504f1f0b90659f447f726c64d8a4389ce84 Mon Sep 17 00:00:00 2001
+From: Shreyansh Kaushik <smkaushi@ucsc.edu>
+Date: Tue, 17 Nov 2026 00:29:26 -0800
+Subject: [PATCH] Prefer an on-link LAN address over a sticky VPN overlay
+ address
+
+---
+ app/backend/nvcomputer.cpp | 46 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/app/backend/nvcomputer.cpp b/app/backend/nvcomputer.cpp
+index 60f06e0..5be15dd 100644
+--- a/app/backend/nvcomputer.cpp
++++ b/app/backend/nvcomputer.cpp
+@@ -7,6 +7,8 @@
+ #include <QNetworkInterface>
+ #include <QNetworkProxy>
+ 
++#include <algorithm>
++
+ #define SER_NAME "hostname"
+ #define SER_UUID "uuid"
+ #define SER_MAC "mac"
+@@ -482,6 +484,43 @@ bool NvComputer::updateAppList(QVector<NvApp> newAppList) {
+     return true;
+ }
+ 
++// Lightpath: Tailscale addresses (100.64.0.0/10, fd7a:115c:a1e0::/48, *.ts.net) reach the
++// host through a WireGuard tunnel: encrypted twice and limited to a 1280 byte MTU.
++static bool isOverlayAddress(const QString& address)
++{
++    QHostAddress host(address);
++    if (host.isNull()) {
++        return address.endsWith(".ts.net", Qt::CaseInsensitive);
++    }
++    return host.isInSubnet(QHostAddress("100.64.0.0"), 10) ||
++           host.isInSubnet(QHostAddress("fd7a:115c:a1e0::"), 48);
++}
++
++// True when one of our own (non-overlay) interfaces is on the same subnet as the address,
++// meaning the host should be reachable directly over the local network.
++static bool isOnLinkAddress(const QString& address)
++{
++    QHostAddress host(address);
++    if (host.isNull() || host.isLoopback() || isOverlayAddress(address)) {
++        return false;
++    }
++    const auto interfaces = QNetworkInterface::allInterfaces();
++    for (const QNetworkInterface& iface : interfaces) {
++        if (!(iface.flags() & QNetworkInterface::IsUp) || (iface.flags() & QNetworkInterface::IsLoopBack)) {
++            continue;
++        }
++        const auto entries = iface.addressEntries();
++        for (const QNetworkAddressEntry& entry : entries) {
++            if (entry.prefixLength() > 0 && !isOverlayAddress(entry.ip().toString()) &&
++                    entry.ip().protocol() == host.protocol() &&
++                    host.isInSubnet(entry.ip(), entry.prefixLength())) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ QVector<NvAddress> NvComputer::uniqueAddresses() const
+ {
+     QReadLocker readLocker(&lock);
+@@ -510,6 +549,13 @@ QVector<NvAddress> NvComputer::uniqueAddresses() const
+         }
+     }
+ 
++    // Lightpath: when the host is on our local network, try its LAN address before a sticky
++    // VPN overlay address so that streams at home take the direct path.
++    if (!uniqueAddressList.isEmpty() && isOverlayAddress(uniqueAddressList.first().address())) {
++        std::stable_partition(uniqueAddressList.begin(), uniqueAddressList.end(),
++                              [](const NvAddress& addr) { return isOnLinkAddress(addr.address()); });
++    }
++
+     // We must have at least 1 address
+     Q_ASSERT(!uniqueAddressList.isEmpty());
+ 
+-- 
+2.56.0
+
