@@ -57,9 +57,8 @@ In Terminal, `lightpath status` shows how the PC is reachable and how fast the l
   signed in to the same Tailscale account.
 - **Wake from the Mac, anywhere:** at home, Wake-on-Wi-Fi magic packets straight from the Mac.
   Away, an always-on device at home relays the wake: the Mac posts `wake` to a private
-  [ntfy](https://ntfy.sh) topic and the house's Kindle hub
-  ([kindle-home-hub](https://github.com/shreyk273/kindle-home-hub), `hub/src/pcwake.rs`) sends the
-  magic packets on the LAN. The relay URL lives in `~/.config/lightpath/wake-relay` on the PC
+  [ntfy](https://ntfy.sh) topic and an always-on device at home (here a jailbroken Kindle running
+  a small home hub) sends the magic packets on the LAN. The relay URL lives in `~/.config/lightpath/wake-relay` on the PC
   and reaches the Mac only through the Tailscale-authenticated agent. The PC's global IPv6
   addresses and public IPv4 are tried too.
 
