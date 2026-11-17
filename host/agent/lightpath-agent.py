@@ -145,9 +145,22 @@ def wake_relay():
     return url if url.startswith("https://") else None
 
 
+def sunshine_name():
+    """The name Moonlight knows this PC by (sunshine_name in sunshine.conf)."""
+    try:
+        for line in (Path.home() / ".config/sunshine/sunshine.conf").read_text().splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "sunshine_name" and value.strip():
+                return value.strip()
+    except OSError:
+        pass
+    return socket.gethostname()
+
+
 def status():
     return {
         "name": socket.gethostname(),
+        "sunshine_name": sunshine_name(),
         "sunshine_port": SUNSHINE_PORT,
         "lan": lan_info(),
         "tailscale": tailscale_info(),

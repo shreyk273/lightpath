@@ -8,6 +8,7 @@
 #   lightpath pair            pair Moonlight with the PC (automatic, no PIN typing)
 #   lightpath set KEY VALUE   change a setting (see `lightpath settings`)
 #   lightpath settings        show settings
+#   lightpath update          get the newest version of this command
 #
 # Works with macOS's built-in bash 3.2 (no Homebrew needed).
 set -u
@@ -213,7 +214,13 @@ cmd_connect() {
         osascript -e 'tell application "Moonlight" to quit' >/dev/null 2>&1
         for _ in 1 2 3 4 5 6 7 8 9 10; do pgrep -x Moonlight >/dev/null || break; sleep 0.3; done
     fi
-    open -a "$MOONLIGHT_APP" --args stream "$addr:$SUNSHINE_PORT" "$app" \
+    # Ask for the PC by name, not address: Moonlight then uses whichever of its known
+    # addresses answers (home network first, Tailscale otherwise), so a blocked route can't
+    # leave it stuck. The address is the fallback for a PC it doesn't know by name yet.
+    local target
+    target="$(json "$HOSTJSON" sunshine_name)"
+    [ -n "$target" ] || target="$addr:$SUNSHINE_PORT"
+    open -a "$MOONLIGHT_APP" --args stream "$target" "$app" \
         --resolution "$size" --fps "$FPS" --bitrate "$kbps" --video-codec "$codec" \
         --display-mode borderless --no-vsync --no-frame-pacing --game-optimization \
         --no-quit-after --keep-awake
@@ -287,6 +294,13 @@ case "${1:-connect}" in
     wake) cmd_wake ;;
     status) cmd_status ;;
     pair) cmd_pair ;;
+    update)
+        tmp="$(mktemp)"
+        curl -fsSL -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/shreyk273/lightpath/contents/mac/lightpath?ref=main" -o "$tmp" \
+            && bash -n "$tmp" && sudo install -m 755 "$tmp" /usr/local/bin/lightpath && say "Updated." \
+            || die "Update failed."
+        rm -f "$tmp" ;;
     set) shift; cmd_set "$@" ;;
     settings) cmd_settings ;;
     -h|--help|help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
