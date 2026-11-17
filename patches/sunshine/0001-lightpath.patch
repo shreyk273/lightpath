@@ -1,4 +1,4 @@
-From 8fa67202dd9b8ae5707403ca0407a9790416ea9d Mon Sep 17 00:00:00 2001
+From 5ada90243ad6dace181b9724a44f6aa428e43262 Mon Sep 17 00:00:00 2001
 From: Shreyansh Kaushik <smkaushi@ucsc.edu>
 Date: Tue, 17 Nov 2026 00:23:24 -0800
 Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
@@ -8,15 +8,15 @@ Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
  cmake/compile_definitions/linux.cmake |  11 +-
  cmake/prep/options.cmake              |   2 +
  docs/configuration.md                 |   2 +-
- src/config.cpp                        |   3 +
- src/config.h                          |   1 +
+ src/config.cpp                        |  10 +
+ src/config.h                          |   3 +
  src/platform/common.h                 |   9 +
  src/platform/linux/misc.cpp           |  34 +
  src/platform/linux/muttergrab.cpp     | 928 ++++++++++++++++++++++++++
  src/platform/linux/pipewire.cpp       |  77 ++-
  src/rtsp.cpp                          |  72 ++
- src/video.cpp                         |   9 +
- 11 files changed, 1132 insertions(+), 16 deletions(-)
+ src/video.cpp                         |  33 +-
+ 11 files changed, 1162 insertions(+), 19 deletions(-)
  create mode 100644 src/platform/linux/muttergrab.cpp
 
 diff --git a/cmake/compile_definitions/linux.cmake b/cmake/compile_definitions/linux.cmake
@@ -73,28 +73,37 @@ index 6024df7..403d93f 100644
      </tr>
      <tr>
 diff --git a/src/config.cpp b/src/config.cpp
-index 77d2d46..7a2df1a 100644
+index 77d2d46..9acf403 100644
 --- a/src/config.cpp
 +++ b/src/config.cpp
-@@ -1693,6 +1693,9 @@ namespace config {
+@@ -1693,6 +1693,16 @@ namespace config {
      video.nv_legacy.h264_coder = video.nv.h264_cavlc ? NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC : NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
      video.nv_legacy.spatial_aq = video.nv.adaptive_quantization;
      video.nv_legacy.vbv_percentage_increase = video.nv.vbv_percentage_increase;
 +    video.nv_legacy.split_encode_mode = video.nv.split_frame_encoding == nvenc::nvenc_split_frame_encoding::disabled      ? NV_ENC_SPLIT_DISABLE_MODE :
 +                                        video.nv.split_frame_encoding == nvenc::nvenc_split_frame_encoding::force_enabled ? NV_ENC_SPLIT_AUTO_FORCED_MODE :
 +                                                                                                                             NV_ENC_SPLIT_AUTO_MODE;
++    // Low-bitrate (Internet) streams are limited by the network, not by encoder latency, so they
++    // can afford a slower preset that packs more picture into every bit.
++    int preset_low_bitrate = 0;
++    int_between_f(vars, "nvenc_preset_low_bitrate", preset_low_bitrate, {0, 7});
++    video.nv_legacy.preset_low_bitrate = preset_low_bitrate > 0 ? nv::ffmpeg_preset_from_quality(preset_low_bitrate) : std::string {};
++    video.nv_legacy.low_bitrate_kbps = 50000;
++    int_between_f(vars, "nvenc_low_bitrate_kbps", video.nv_legacy.low_bitrate_kbps, {0, 1000000});
  #endif
  
      int_f(vars, "qsv_preset", video.qsv.qsv_preset, qsv::preset_from_view);
 diff --git a/src/config.h b/src/config.h
-index dc890e2..1ff99e3 100644
+index dc890e2..81f016e 100644
 --- a/src/config.h
 +++ b/src/config.h
-@@ -98,6 +98,7 @@ namespace config {
+@@ -98,6 +98,9 @@ namespace config {
        int h264_coder;  ///< Legacy NVENC H.264 entropy-coding mode.
        int spatial_aq;  ///< FFmpeg NVENC spatial adaptive-quantization mode.
        int vbv_percentage_increase;  ///< Legacy NVENC VBV buffer-size percentage increase.
 +      int split_encode_mode;  ///< FFmpeg NVENC split-frame encoding mode (HEVC/AV1, GPUs with multiple NVENC engines).
++      std::string preset_low_bitrate;  ///< FFmpeg NVENC preset for streams at or below low_bitrate_kbps (empty = use preset).
++      int low_bitrate_kbps;  ///< Client bitrate (kbps) at or below which preset_low_bitrate is used.
      } nv_legacy;  ///< Legacy NVIDIA encoder options kept for config compatibility.
  
      struct {
@@ -1375,10 +1384,41 @@ index cd2dd9e..36e3f71 100644
        config.monitor.width = (int) util::from_view(args.at("x-nv-video[0].clientViewportWd"sv));
  
 diff --git a/src/video.cpp b/src/video.cpp
-index 995e8a7..1decf56 100644
+index 995e8a7..6e9612d 100644
 --- a/src/video.cpp
 +++ b/src/video.cpp
-@@ -858,6 +858,7 @@ namespace video {
+@@ -777,6 +777,24 @@ namespace video {
+   auto capture_thread_async = safe::make_shared<capture_thread_async_ctx_t>(start_capture_async, end_capture_async);  ///< Capture thread async.
+   auto capture_thread_sync = safe::make_shared<capture_thread_sync_ctx_t>(start_capture_sync, end_capture_sync);  ///< Capture thread sync.
+ 
++  /**
++   * @brief Pick the NVENC preset for one stream.
++   *
++   * Streams at or below `nvenc_low_bitrate_kbps` (typically over the Internet) get
++   * `nvenc_preset_low_bitrate`: the extra encode time is small next to network latency, and the
++   * slower preset gives a visibly better picture when bits are scarce.
++   *
++   * @param config Client stream configuration.
++   * @return FFmpeg preset name.
++   */
++  const std::string nvenc_preset_for_stream(const config_t &config) {
++    const auto &nv = config::video.nv_legacy;
++    if (!nv.preset_low_bitrate.empty() && config.bitrate > 0 && config.bitrate <= nv.low_bitrate_kbps) {
++      return nv.preset_low_bitrate;
++    }
++    return nv.preset;
++  }
++
+ #ifdef _WIN32
+   /**
+    * @brief NVENC.
+@@ -853,11 +871,12 @@ namespace video {
+         {"zerolatency"s, 1},
+         {"surfaces"s, 1},
+         {"cbr_padding"s, false},
+-        {"preset"s, &config::video.nv_legacy.preset},
++        {"preset"s, nvenc_preset_for_stream},
+         {"tune"s, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY},
          {"rc"s, NV_ENC_PARAMS_RC_CBR},
          {"multipass"s, &config::video.nv_legacy.multipass},
          {"spatial-aq"s, &config::video.nv_legacy.spatial_aq},
@@ -1386,7 +1426,13 @@ index 995e8a7..1decf56 100644
        },
        {},  // SDR-specific options
        {},  // HDR-specific options
-@@ -880,6 +881,7 @@ namespace video {
+@@ -875,11 +894,12 @@ namespace video {
+         {"zerolatency"s, 1},
+         {"surfaces"s, 1},
+         {"cbr_padding"s, false},
+-        {"preset"s, &config::video.nv_legacy.preset},
++        {"preset"s, nvenc_preset_for_stream},
+         {"tune"s, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY},
          {"rc"s, NV_ENC_PARAMS_RC_CBR},
          {"multipass"s, &config::video.nv_legacy.multipass},
          {"spatial-aq"s, &config::video.nv_legacy.spatial_aq},
@@ -1394,7 +1440,16 @@ index 995e8a7..1decf56 100644
        },
        {
          // SDR-specific options
-@@ -3179,6 +3181,13 @@ namespace video {
+@@ -904,7 +924,7 @@ namespace video {
+         {"zerolatency"s, 1},
+         {"surfaces"s, 1},
+         {"cbr_padding"s, false},
+-        {"preset"s, &config::video.nv_legacy.preset},
++        {"preset"s, nvenc_preset_for_stream},
+         {"tune"s, NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY},
+         {"rc"s, NV_ENC_PARAMS_RC_CBR},
+         {"coder"s, &config::video.nv_legacy.h264_coder},
+@@ -3179,6 +3199,13 @@ namespace video {
      const auto output_name {display_device::map_output_name(config::video.output_name)};
      std::shared_ptr<platf::display_t> disp;
  

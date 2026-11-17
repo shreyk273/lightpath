@@ -34,6 +34,7 @@ In Terminal, `lightpath status` shows how the PC is reachable and how fast the l
 |---|---|
 | **Virtual display matched to the client** (`capture = mutter`) | For every stream GNOME creates a monitor with exactly the Mac's resolution and refresh rate (3024x1890 @ 120 Hz on a 14" MacBook Pro), makes it the only display, captures it zero-copy (DMA-BUF into NVENC) and removes it afterwards, restoring the projector/monitor. No scaling anywhere, frames come from a 120 Hz compositor clock and are encoded the instant they're rendered. |
 | **NVENC split-frame encoding on Linux** | Upstream only offers it on Windows. On GPUs with two NVENC engines (RTX 4090) each frame is encoded as two halves in parallel: **3.6 → 2.2 ms per frame**. |
+| **Bitrate-aware encoder preset** | `nvenc_preset_low_bitrate`: streams at or below 60 Mbps (away from home) use the slower P4 preset for a better picture per bit (+1.2 ms, irrelevant next to Internet latency); home streams keep P1. |
 | **Route-MTU packet sizing** | Video packets are capped to what fits the route to the client (1280-byte MTU over Tailscale), so they are never IP-fragmented. |
 | **PipeWire fixes** | Uninitialized stream state could crash Sunshine on teardown; a format renegotiation right after start was treated as a dead stream (1 s freeze + full re-init). |
 
