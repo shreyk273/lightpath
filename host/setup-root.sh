@@ -12,6 +12,7 @@
 #   3. Enables tailscaled and lets <username> control it without sudo.
 #   4. Loads uinput at boot (virtual keyboard/mouse/gamepads for the stream).
 #   5. Applies network sysctls sized for 100+ Mbps video bursts.
+#   6. Logs the desktop back in by itself after a logout (GDM timed login).
 set -euo pipefail
 
 TARGET_USER="${1:-${SUDO_USER:-}}"
@@ -100,3 +101,11 @@ EOF
 sysctl --system >/dev/null
 
 log "Root setup done."
+
+# --------------------------------------------------------------------------- 6. log back in after logout
+# Streaming needs a logged-in desktop. GDM's automatic login only happens at boot, so after a
+# logout the PC would sit at the login screen and the Mac could not connect. A timed login logs
+# the user back in 10 s after the login screen appears (still lets someone pick another account).
+if [[ -f /etc/gdm/custom.conf ]] && ! grep -q '^TimedLoginEnable' /etc/gdm/custom.conf; then
+  sed -i "/^\[daemon\]/a TimedLoginEnable=True\nTimedLogin=${SUDO_USER:-$USER}\nTimedLoginDelay=10" /etc/gdm/custom.conf
+fi
