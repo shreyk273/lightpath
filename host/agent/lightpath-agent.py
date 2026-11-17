@@ -188,12 +188,21 @@ def approve_pairing(client_ip, pin, name):
     return False
 
 
+def _prune(obj):
+    """Drop None values: the Mac reads this JSON with plutil, which has no null."""
+    if isinstance(obj, dict):
+        return {k: _prune(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_prune(v) for v in obj if v is not None]
+    return obj
+
+
 # --------------------------------------------------------------------------- HTTP
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "lightpath-agent/1"
 
     def _json(self, code, obj):
-        body = json.dumps(obj).encode()
+        body = json.dumps(_prune(obj)).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
