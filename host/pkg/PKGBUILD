@@ -1,0 +1,45 @@
+# Lightpath build of Sunshine: upstream LizardByte/Sunshine + patches/sunshine/*.patch
+#
+# Built by host/build-sunshine.sh, which prepares the patched source tree and exports:
+#   LIGHTPATH_SUNSHINE_SRC    patched Sunshine checkout (with submodules)
+#   LIGHTPATH_SUNSHINE_BUILD  optional: an already-built CMake tree to package as-is
+#   LIGHTPATH_VERSION         version string shown by Sunshine
+pkgname=sunshine-lightpath
+pkgver=${LIGHTPATH_VERSION:-2026.1117}
+pkgrel=1
+pkgdesc="Sunshine game stream host with Lightpath patches (client-matched GNOME virtual display, Linux NVENC split-frame)"
+arch=('x86_64')
+url="https://github.com/shreyk273/lightpath"
+license=('GPL-3.0-only')
+install=sunshine.install
+options=('!debug' '!strip')
+depends=(avahi curl gcc-libs gtk3 hicolor-icon-theme libayatana-appindicator libcap libdrm libevdev
+         libmfx libpipewire libpulse libva libx11 libxcb libxfixes libxrandr libxtst miniupnpc numactl
+         openssl opus qt6-base qt6-svg udev vulkan-icd-loader which)
+makedepends=(appstream appstream-glib cmake cuda desktop-file-utils git make nodejs npm python-jinja shaderc)
+provides=('sunshine')
+conflicts=('sunshine')
+
+build() {
+  [[ -n "${LIGHTPATH_SUNSHINE_BUILD:-}" ]] && return 0
+  : "${LIGHTPATH_SUNSHINE_SRC:?set by host/build-sunshine.sh}"
+  export CUDA_PATH=/opt/cuda NVCC_CCBIN=/usr/bin/g++
+  # Native tuning: Reed-Solomon FEC, crypto and packetisation run on the CPU for every frame.
+  export CFLAGS="-O3 -march=native -pipe" CXXFLAGS="-O3 -march=native -pipe"
+  export BUILD_VERSION="${pkgver}-lightpath" BRANCH=lightpath
+  cmake -S "$LIGHTPATH_SUNSHINE_SRC" -B build -Wno-dev \
+    -D CMAKE_BUILD_TYPE=Release \
+    -D CMAKE_CUDA_ARCHITECTURES="${LIGHTPATH_CUDA_ARCH:-native}" \
+    -D BUILD_DOCS=OFF -D BUILD_TESTS=OFF -D BUILD_WERROR=OFF \
+    -D CMAKE_INSTALL_PREFIX=/usr \
+    -D SUNSHINE_EXECUTABLE_PATH=/usr/bin/sunshine \
+    -D SUNSHINE_ASSETS_DIR="share/sunshine" \
+    -D SUNSHINE_PUBLISHER_NAME='LizardByte' \
+    -D SUNSHINE_PUBLISHER_WEBSITE='https://app.lizardbyte.dev' \
+    -D SUNSHINE_PUBLISHER_ISSUE_URL='https://app.lizardbyte.dev/support'
+  cmake --build build -j"$(nproc)"
+}
+
+package() {
+  DESTDIR="$pkgdir" cmake --install "${LIGHTPATH_SUNSHINE_BUILD:-build}"
+}
