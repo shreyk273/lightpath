@@ -1,0 +1,41 @@
+From fed45b8c6e7b61d196340ee6300d70e5cedbfeaa Mon Sep 17 00:00:00 2001
+From: Shreyansh Kaushik <smkaushi@ucsc.edu>
+Date: Tue, 17 Nov 2026 01:30:46 -0800
+Subject: [PATCH] Size packets for Tailscale overlays when the route is
+ detected as a VPN
+
+---
+ app/streaming/session.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/app/streaming/session.cpp b/app/streaming/session.cpp
+index b3fdfde..53a57f0 100644
+--- a/app/streaming/session.cpp
++++ b/app/streaming/session.cpp
+@@ -1,5 +1,7 @@
+ #include "session.h"
+ #include "streamactivity.h"
++
++#include <QHostAddress>
+ #include "settings/streamingpreferences.h"
+ #include "streaming/streamutils.h"
+ #include "backend/richpresencemanager.h"
+@@ -1695,6 +1697,15 @@ bool Session::startConnectionAsync()
+             // Treat it as remote even if the target address is in RFC 1918 address space.
+             m_StreamConfig.streamingRemotely = STREAM_CFG_REMOTE;
+             m_StreamConfig.packetSize = 1024;
++            {
++                // Lightpath: WireGuard overlays (Tailscale) carry a 1280 byte MTU, which 1216 byte
++                // packets fill exactly (IPv6 40 + UDP 8 + RTP 16 = 64 bytes of headers).
++                QHostAddress active(m_Computer->activeAddress.address());
++                if (active.isInSubnet(QHostAddress("100.64.0.0"), 10) ||
++                        active.isInSubnet(QHostAddress("fd7a:115c:a1e0::"), 48)) {
++                    m_StreamConfig.packetSize = 1216;
++                }
++            }
+             break;
+         default:
+             // If we don't have reachability info, let moonlight-common-c decide.
+-- 
+2.56.0
+

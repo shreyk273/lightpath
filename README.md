@@ -35,6 +35,7 @@ In Terminal, `lightpath status` shows how the PC is reachable and how fast the l
 | **Virtual display matched to the client** (`capture = mutter`) | For every stream GNOME creates a monitor with exactly the Mac's resolution and refresh rate (3024x1890 @ 120 Hz on a 14" MacBook Pro), makes it the only display, captures it zero-copy (DMA-BUF into NVENC) and removes it afterwards, restoring the projector/monitor. No scaling anywhere, frames come from a 120 Hz compositor clock and are encoded the instant they're rendered. |
 | **NVENC split-frame encoding on Linux** | Upstream only offers it on Windows. On GPUs with two NVENC engines (RTX 4090) each frame is encoded as two halves in parallel: **3.6 → 2.2 ms per frame**. |
 | **Bitrate-aware encoder preset** | `nvenc_preset_low_bitrate`: streams at or below 60 Mbps (away from home) use the slower P4 preset for a better picture per bit (+1.2 ms, irrelevant next to Internet latency); home streams keep P1. |
+| **Advertise the LAN address over VPNs** | A client that pairs over Tailscale used to learn only the Tailscale address, so at home it kept streaming through the tunnel. The PC now reports its LAN address (and Wi-Fi MAC for Wake-on-LAN) to such clients, so they switch to the direct path whenever they're home. |
 | **Route-MTU packet sizing** | Video packets are capped to what fits the route to the client (1280-byte MTU over Tailscale), so they are never IP-fragmented. |
 | **PipeWire fixes** | Uninitialized stream state could crash Sunshine on teardown; a format renegotiation right after start was treated as a dead stream (1 s freeze + full re-init). |
 
@@ -43,7 +44,7 @@ In Terminal, `lightpath status` shows how the PC is reachable and how fast the l
 | Change | Why it matters |
 |---|---|
 | **awdl-guard** (`mac/awdl-guard/`) | macOS's AirDrop radio (AWDL) makes Wi-Fi hop channels several times a second, causing periodic lag spikes. A tiny root daemon turns it off only while a stream is running and restores it afterwards. |
-| **VPN-aware packet size** | Over Tailscale, packets fill exactly one 1280-byte tunnel MTU instead of 1024 bytes (or fragmenting on IPv6). |
+| **VPN-aware packet size** | Over Tailscale, packets fill exactly one 1280-byte tunnel MTU (1216-byte payloads) instead of 1024 bytes, in both Moonlight's own VPN detection and the generic path. |
 | **Prefer the home network** | Moonlight no longer sticks to the Tailscale route when you're back home. |
 | **Latency-critical activity** | macOS never applies App Nap or timer coalescing to Moonlight while streaming. |
 | **Native size below the notch** | The stream is sized to the Mac's screen area below the notch, so every pixel maps 1:1. |

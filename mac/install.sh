@@ -163,11 +163,16 @@ make_app "Lightpath" "connect"
 make_app "Lightpath Steam" "steam"
 
 # ------------------------------------------------------------------ pair
-say "Pairing with your PC (automatic)…"
-if /usr/local/bin/lightpath pair; then
+if defaults read com.moonlight-stream.Moonlight 2>/dev/null | grep -q srvcert; then
+    say "Already paired with your PC."
     PAIRED=1
 else
-    PAIRED=0
+    say "Pairing with your PC (automatic)…"
+    if /usr/local/bin/lightpath pair; then
+        PAIRED=1
+    else
+        PAIRED=0
+    fi
 fi
 
 printf '\n\033[1;32m✓ Lightpath is ready.\033[0m\n'

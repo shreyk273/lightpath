@@ -1,4 +1,4 @@
-From 5ada90243ad6dace181b9724a44f6aa428e43262 Mon Sep 17 00:00:00 2001
+From 5437c97bf244e670b1fe4b673f7da4c1938e71c6 Mon Sep 17 00:00:00 2001
 From: Shreyansh Kaushik <smkaushi@ucsc.edu>
 Date: Tue, 17 Nov 2026 00:23:24 -0800
 Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
@@ -10,13 +10,14 @@ Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
  docs/configuration.md                 |   2 +-
  src/config.cpp                        |  10 +
  src/config.h                          |   3 +
+ src/nvhttp.cpp                        |  69 +-
  src/platform/common.h                 |   9 +
  src/platform/linux/misc.cpp           |  34 +
  src/platform/linux/muttergrab.cpp     | 928 ++++++++++++++++++++++++++
  src/platform/linux/pipewire.cpp       |  77 ++-
  src/rtsp.cpp                          |  72 ++
  src/video.cpp                         |  33 +-
- 11 files changed, 1162 insertions(+), 19 deletions(-)
+ 12 files changed, 1228 insertions(+), 22 deletions(-)
  create mode 100644 src/platform/linux/muttergrab.cpp
 
 diff --git a/cmake/compile_definitions/linux.cmake b/cmake/compile_definitions/linux.cmake
@@ -107,6 +108,109 @@ index dc890e2..81f016e 100644
      } nv_legacy;  ///< Legacy NVIDIA encoder options kept for config compatibility.
  
      struct {
+diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
+index 7601cb8..3f2580c 100644
+--- a/src/nvhttp.cpp
++++ b/src/nvhttp.cpp
+@@ -12,6 +12,7 @@
+ #include <filesystem>
+ #include <format>
+ #include <mutex>
++#include <optional>
+ #include <string>
+ #include <utility>
+ 
+@@ -44,6 +45,68 @@
+ using namespace std::literals;
+ 
+ namespace nvhttp {
++  namespace {
++    /**
++     * @brief Whether an address belongs to a VPN overlay (Tailscale: 100.64.0.0/10, fd7a:115c:a1e0::/48).
++     *
++     * @param address Address to classify.
++     * @return True for overlay addresses.
++     */
++    bool is_overlay_address(const boost::asio::ip::address &address) {
++      if (address.is_v6()) {
++        const auto v6 = address.to_v6();
++        if (v6.is_v4_mapped()) {
++          return is_overlay_address(boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped, v6));
++        }
++        const auto b = v6.to_bytes();
++        return b[0] == 0xfd && b[1] == 0x7a && b[2] == 0x11 && b[3] == 0x5c && b[4] == 0xa1 && b[5] == 0xe0;
++      }
++      return (address.to_v4().to_uint() & 0xFFC00000u) == 0x64400000u;
++    }
++
++    /**
++     * @brief The LAN IPv4 address of the default route (no packet is sent).
++     *
++     * @return Address, or empty when there is no usable default route.
++     */
++    std::optional<boost::asio::ip::address> default_route_v4() {
++      boost::asio::io_context io;
++      boost::system::error_code ec;
++      boost::asio::ip::udp::socket socket(io);
++      socket.open(boost::asio::ip::udp::v4(), ec);
++      if (!ec) {
++        socket.connect({boost::asio::ip::make_address_v4("1.1.1.1"), 53}, ec);
++      }
++      if (ec) {
++        return std::nullopt;
++      }
++      const auto address = socket.local_endpoint(ec).address();
++      if (ec || address.is_unspecified() || is_overlay_address(address)) {
++        return std::nullopt;
++      }
++      return address;
++    }
++
++    /**
++     * @brief The host address to advertise as LocalIP (and to look up the MAC address for).
++     *
++     * A client that reaches us through a VPN overlay would otherwise learn only the overlay
++     * address and keep using the tunnel even when it is on the same LAN. Advertising the LAN
++     * address lets it switch to the direct path whenever that is reachable.
++     *
++     * @param local Local endpoint address of the request.
++     * @return Address to advertise.
++     */
++    boost::asio::ip::address advertised_local_address(const boost::asio::ip::address &local) {
++      if (is_overlay_address(local)) {
++        if (auto lan = default_route_v4()) {
++          return *lan;
++        }
++      }
++      return local;
++    }
++  }  // namespace
++
+ 
+   static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Sunshine. Moonlight-qt will report Malformed XML (missing root element)."sv;
+ 
+@@ -1274,7 +1337,7 @@ namespace nvhttp {
+     // Only include the MAC address for requests sent from paired clients over HTTPS.
+     // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
+     if constexpr (std::is_same_v<SunshineHTTPS, T>) {
+-      tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(local_endpoint.address())));
++      tree.put("root.mac", platf::get_mac_address(net::addr_to_normalized_string(advertised_local_address(local_endpoint.address()))));
+     } else {
+       tree.put("root.mac", "00:00:00:00:00:00");
+     }
+@@ -1288,10 +1351,10 @@ namespace nvhttp {
+     // have that implemented. For now, we will emulate the behavior of GFE+GS-IPv6-Forwarder,
+     // which returns 127.0.0.1 as LocalIP for IPv6 connections. Moonlight clients with IPv6
+     // support know to ignore this bogus address.
+-    if (local_endpoint.address().is_v6() && !local_endpoint.address().to_v6().is_v4_mapped()) {
++    if (const auto advertised = advertised_local_address(local_endpoint.address()); advertised.is_v6() && !advertised.to_v6().is_v4_mapped()) {
+       tree.put("root.LocalIP", "127.0.0.1");
+     } else {
+-      tree.put("root.LocalIP", net::addr_to_normalized_string(local_endpoint.address()));
++      tree.put("root.LocalIP", net::addr_to_normalized_string(advertised));
+     }
+ 
+     const uint32_t codec_mode_flags = get_codec_mode_flags();
 diff --git a/src/platform/common.h b/src/platform/common.h
 index b261688..943e633 100644
 --- a/src/platform/common.h

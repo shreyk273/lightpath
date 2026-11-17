@@ -8,7 +8,7 @@
 #   lightpath pair            pair Moonlight with the PC (automatic, no PIN typing)
 #   lightpath set KEY VALUE   change a setting (see `lightpath settings`)
 #   lightpath settings        show settings
-#   lightpath update          get the newest version of this command
+#   lightpath update          update Moonlight, the helpers and this command
 #
 # Works with macOS's built-in bash 3.2 (no Homebrew needed).
 set -u
@@ -295,12 +295,10 @@ case "${1:-connect}" in
     status) cmd_status ;;
     pair) cmd_pair ;;
     update)
-        tmp="$(mktemp)"
+        # Re-run the installer: newest Moonlight build, helpers and this command. Settings and
+        # pairing are kept.
         curl -fsSL -H "Accept: application/vnd.github.raw" \
-            "https://api.github.com/repos/shreyk273/lightpath/contents/mac/lightpath?ref=main" -o "$tmp" \
-            && bash -n "$tmp" && sudo install -m 755 "$tmp" /usr/local/bin/lightpath && say "Updated." \
-            || die "Update failed."
-        rm -f "$tmp" ;;
+            "https://api.github.com/repos/shreyk273/lightpath/contents/mac/install.sh?ref=main" | bash ;;
     set) shift; cmd_set "$@" ;;
     settings) cmd_settings ;;
     -h|--help|help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
