@@ -17,6 +17,7 @@ import base64
 import http.server
 import ipaddress
 import json
+import plistlib
 import os
 import re
 import secrets
@@ -239,7 +240,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         if url.path == "/status":
-            if self._authorized():
+            if not self._authorized():
+                return
+            if "plist" in urllib.parse.parse_qs(url.query).get("format", []):
+                # Macs read property lists natively (plutil), no JSON parser needed.
+                body = plistlib.dumps(_prune(status()))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-plist")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
                 self._json(200, status())
         elif url.path == "/speedtest":
             if not self._authorized():

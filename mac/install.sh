@@ -51,7 +51,7 @@ done
 
 # ------------------------------------------------------------------ downloads
 say "Downloading Lightpath…"
-curl -fsSL "$RAW/mac/lightpath" -o "$WORK/lightpath"
+curl -fsSL "$RAW/mac/lightpath?nocache=$(date +%s)" -o "$WORK/lightpath"
 HAVE_TOOLS=1
 for f in awdl-guard lightpath-wake SHA256SUMS; do
     curl -fsSL "$REL/$f" -o "$WORK/$f" || HAVE_TOOLS=0
