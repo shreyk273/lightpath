@@ -220,10 +220,15 @@ cmd_connect() {
     local target
     target="$(json "$HOSTJSON" sunshine_name)"
     [ -n "$target" ] || target="$addr:$SUNSHINE_PORT"
+    # Desktop: the pointer follows the Mac's own cursor movement (absolute), exactly like a Mac
+    # app. Games: relative movement, so mouse-look works. Ctrl+Option+Shift+M switches live.
+    local mouse=--absolute-mouse
+    [ "$app" = "Desktop" ] || mouse=--no-absolute-mouse
+    # Full screen keeps Cmd+Tab, Cmd+Space, Cmd+Q, ... for the PC; swipe between spaces to leave.
     open -a "$MOONLIGHT_APP" --args stream "$target" "$app" \
         --resolution "$size" --fps "$FPS" --bitrate "$kbps" --video-codec "$codec" \
         --display-mode borderless --no-vsync --no-frame-pacing --game-optimization \
-        --no-quit-after --keep-awake
+        --no-quit-after --keep-awake --capture-system-keys fullscreen "$mouse"
 }
 
 cmd_wake() {

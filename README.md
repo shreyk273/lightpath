@@ -23,6 +23,12 @@ picks the fastest route, and opens the PC's desktop full screen at your Mac's ex
 and 120 Hz. **Lightpath Steam** goes straight to Steam Big Picture.
 Press **Ctrl+Option+Shift+Q** to stop. **Ctrl+Option+Shift+S** shows live performance stats.
 
+**It behaves like a Mac.** Your usual shortcuts work on the PC (Cmd+C / Cmd+V, Cmd+Z, Cmd+Tab,
+Cmd+Space to search, Cmd+Left/Right, Option+arrows to jump words, Cmd+Q to quit an app), copy
+and paste works between the Mac and the PC in both directions (text and pictures), and the
+trackpad scrolls, pinches to zoom and swipes back/forward the way it does on the Mac. Swipe
+between spaces (or Cmd+Tab out of full screen with Ctrl+Option+Shift+Z first) to get back to the Mac.
+
 In Terminal, `lightpath status` shows how the PC is reachable and how fast the link is;
 `lightpath wake` just wakes it.
 
@@ -34,6 +40,9 @@ In Terminal, `lightpath status` shows how the PC is reachable and how fast the l
 |---|---|
 | **Virtual display matched to the client** (`capture = mutter`) | For every stream GNOME creates a monitor with exactly the Mac's resolution and refresh rate (3024x1890 @ 120 Hz on a 14" MacBook Pro), makes it the only display, captures it zero-copy (DMA-BUF into NVENC) and removes it afterwards, restoring the projector/monitor. No scaling anywhere, frames come from a 120 Hz compositor clock and are encoded the instant they're rendered. |
 | **NVENC split-frame encoding on Linux** | Upstream only offers it on Windows. On GPUs with two NVENC engines (RTX 4090) each frame is encoded as two halves in parallel: **3.6 → 2.2 ms per frame**. |
+| **Mac shortcuts on the PC** (`src/mac_keymap.h`) | For Mac clients only, Cmd+key becomes Ctrl+key, Cmd+click Ctrl+click, Cmd+Tab/Cmd+\` the window switcher, Cmd+Space search, Cmd+arrows line/document edges, Cmd+Backspace delete-to-line-start, Cmd+[ / ] back/forward, Cmd+H/M hide, Option+arrows/Backspace/Delete whole words. Host modifiers are always pressed before stale ones are released, so no app ever sees a stray Alt tap; a randomized stress test proves no key is ever left stuck. |
+| **Shared clipboard** (`/lightpath/clipboard`) | Copy on the Mac, paste on the PC and the other way round: text and PNG images up to 16 MB, through GNOME's own remote-desktop clipboard API, over the paired client-certificate HTTPS channel. Syncs the moment you switch between the stream and a Mac app; nothing polls. |
+| **Trackpad-quality scrolling** | Mac trackpad deltas are injected as real touchpad scrolling in logical pixels (GNOME remote-desktop API), so content follows the fingers 1:1 with the Mac's own inertia, instead of being turned into mouse-wheel notches. |
 | **Bitrate-aware encoder preset** | `nvenc_preset_low_bitrate`: streams at or below 60 Mbps (away from home) use the slower P4 preset for a better picture per bit (+1.2 ms, irrelevant next to Internet latency); home streams keep P1. |
 | **Advertise the LAN address over VPNs** | A client that pairs over Tailscale used to learn only the Tailscale address, so at home it kept streaming through the tunnel. The PC now reports its LAN address (and Wi-Fi MAC for Wake-on-LAN) to such clients, so they switch to the direct path whenever they're home. |
 | **Route-MTU packet sizing** | Video packets are capped to what fits the route to the client (1280-byte MTU over Tailscale), so they are never IP-fragmented. |
@@ -47,6 +56,8 @@ In Terminal, `lightpath status` shows how the PC is reachable and how fast the l
 | **VPN-aware packet size** | Over Tailscale, packets fill exactly one 1280-byte tunnel MTU (1216-byte payloads) instead of 1024 bytes, in both Moonlight's own VPN detection and the generic path. |
 | **Prefer the home network** | Moonlight no longer sticks to the Tailscale route when you're back home. |
 | **Latency-critical activity** | macOS never applies App Nap or timer coalescing to Moonlight while streaming. |
+| **Mac-native input** (`0004`) | Cmd keys always reach the PC (and Cmd+Q, Cmd+H, Cmd+W no longer quit or hide Moonlight in full screen); precise trackpad and Magic Mouse scrolling with momentum, unclamped; pinch to zoom; two-finger double tap resets zoom; three-finger page swipes go back/forward. The desktop uses the Mac's own pointer acceleration (absolute mouse), games get relative mouse for mouse-look. |
+| **Clipboard sync** (`0004`) | Pushes the Mac clipboard when the stream gets focus, fetches the PC's when it loses focus or ends; one ordered worker thread, echo suppression, never blocks rendering. |
 | **Native size below the notch** | The stream is sized to the Mac's screen area below the notch, so every pixel maps 1:1. |
 
 ### Between them
@@ -79,6 +90,17 @@ PC streaming to itself (Moonlight on the same machine), 3024x1890 @ 120 fps, 150
 120 fps sustained, 0 % frames lost to the network, stream start ~0.3 s.
 Reproduce with `host/tools/loopback-bench.sh`.
 
+## Tested
+
+- `tests/unit/test_mac_keymap.cpp` (in the Sunshine patch): 30 tests of the shortcut translator,
+  23 on the translator itself (including 2,000 random key storms that must never leave a key
+  stuck or release one twice) and 7 through Sunshine's real keyboard path.
+- `host/tests/clipboard/run.sh`: 17 live checks of clipboard sharing and touchpad scrolling
+  against the running GNOME session, under AddressSanitizer/UBSan (UTF-8 text, 300 KB PNG and
+  8 MB payloads both ways, parallel requests, echo suppression, size and type limits).
+- `tests/lightpath/` (in the Moonlight patch): trackpad unit conversion, pinch thresholds,
+  swipe mapping and clipboard ordering/echo rules.
+
 ## Layout
 
 ```
@@ -90,6 +112,7 @@ host/                   Linux host (CachyOS/Arch, GNOME, NVIDIA)
   agent/                lightpath-agent: pairing approval, wake intent, host facts, speed test
   pkg/                  PKGBUILD for sunshine-lightpath
   tools/                loopback benchmark
+  tests/clipboard/      live clipboard + scrolling self-test
 mac/
   install.sh            one-line Mac installer
   lightpath             the Mac command (connect / steam / wake / status / pair / set)

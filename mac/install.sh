@@ -25,16 +25,42 @@ die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*"; exit 1; }
 
 [ "$(uname)" = "Darwin" ] || die "This installer is for macOS."
 
-say "Lightpath needs your Mac password once (to install the Wi-Fi helper)."
-sudo -v < /dev/tty || die "Administrator access is required."
-# Keep sudo alive while we work.
-( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+# ------------------------------------------------------------------ administrator access
+# Asked for only when something system-wide actually changes (first install, a new Wi-Fi helper
+# or Tailscale). Updates that only touch Moonlight and the lightpath command need no password.
+# From Terminal sudo asks as usual; without a terminal (e.g. `lightpath update` started from an
+# app) macOS shows its normal password dialog instead.
+SUDO=(sudo)
+ROOT_READY=0
+as_root() {
+    if [ "$(id -u)" = 0 ]; then "$@"; return; fi
+    if [ "$ROOT_READY" = 0 ]; then
+        if ( : < /dev/tty ) 2>/dev/null; then
+            say "Lightpath needs your Mac password (to install its Wi-Fi helper)."
+            sudo -v < /dev/tty || die "Administrator access is required."
+            # Keep sudo alive while we work.
+            ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+        else
+            cat > "$WORK/askpass" <<'ASKPASS'
+#!/bin/bash
+exec /usr/bin/osascript -e 'display dialog "Lightpath needs your Mac password to install its Wi-Fi helper." default answer "" with hidden answer with title "Lightpath" with icon caution' -e 'text returned of result' 2>/dev/null
+ASKPASS
+            chmod 700 "$WORK/askpass"
+            export SUDO_ASKPASS="$WORK/askpass"
+            SUDO=(sudo -A)
+            "${SUDO[@]}" -v || die "Administrator access is required."
+        fi
+        ROOT_READY=1
+    fi
+    "${SUDO[@]}" "$@"
+}
+same_file() { [ -f "$2" ] && cmp -s "$1" "$2"; }
 
 # ------------------------------------------------------------------ Tailscale
 if [ ! -d "$TS_APP" ]; then
     say "Installing Tailscale…"
     curl -fL --progress-bar "https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg" -o "$WORK/tailscale.pkg"
-    sudo installer -pkg "$WORK/tailscale.pkg" -target / >/dev/null
+    as_root installer -pkg "$WORK/tailscale.pkg" -target / >/dev/null
 fi
 open -a "$TS_APP" || true
 say "Connecting to your PC through Tailscale…"
@@ -87,19 +113,23 @@ if pgrep -x Moonlight >/dev/null; then
     pkill -x Moonlight 2>/dev/null || true
 fi
 hdiutil attach -nobrowse -readonly -mountpoint "$WORK/mnt" "$WORK/Moonlight.dmg" >/dev/null
-rm -rf /Applications/Moonlight.app 2>/dev/null || sudo rm -rf /Applications/Moonlight.app
-ditto "$WORK/mnt/Moonlight.app" /Applications/Moonlight.app 2>/dev/null || sudo ditto "$WORK/mnt/Moonlight.app" /Applications/Moonlight.app
+rm -rf /Applications/Moonlight.app 2>/dev/null || as_root rm -rf /Applications/Moonlight.app
+ditto "$WORK/mnt/Moonlight.app" /Applications/Moonlight.app 2>/dev/null || as_root ditto "$WORK/mnt/Moonlight.app" /Applications/Moonlight.app
 hdiutil detach "$WORK/mnt" >/dev/null
 xattr -dr com.apple.quarantine /Applications/Moonlight.app 2>/dev/null || true
 
 # ------------------------------------------------------------------ helpers
-say "Installing the Wi-Fi helper and the lightpath command…"
-sudo mkdir -p "$LIBEXEC" /usr/local/bin
-sudo install -m 755 "$WORK/lightpath" /usr/local/bin/lightpath
+say "Installing the lightpath command…"
+# Owned by you, so later updates replace it without a password.
+if [ -w /usr/local/bin/lightpath ]; then
+    cat "$WORK/lightpath" > /usr/local/bin/lightpath
+else
+    as_root mkdir -p /usr/local/bin
+    as_root install -o "$(id -u)" -g "$(id -g)" -m 755 "$WORK/lightpath" /usr/local/bin/lightpath
+fi
+chmod 755 /usr/local/bin/lightpath
 if [ "$HAVE_TOOLS" = 1 ]; then
-    sudo install -m 755 "$WORK/awdl-guard" "$WORK/lightpath-wake" "$LIBEXEC/"
-    sudo xattr -d com.apple.quarantine "$LIBEXEC/awdl-guard" "$LIBEXEC/lightpath-wake" 2>/dev/null || true
-    sudo tee "$PLIST" >/dev/null <<'EOF'
+    cat > "$WORK/awdl-guard.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -113,9 +143,18 @@ if [ "$HAVE_TOOLS" = 1 ]; then
 </dict>
 </plist>
 EOF
-    sudo chown root:wheel "$PLIST"
-    sudo launchctl bootout system/com.lightpath.awdl-guard 2>/dev/null || true
-    sudo launchctl bootstrap system "$PLIST"
+    if same_file "$WORK/awdl-guard" "$LIBEXEC/awdl-guard" && same_file "$WORK/lightpath-wake" "$LIBEXEC/lightpath-wake" \
+            && same_file "$WORK/awdl-guard.plist" "$PLIST" && launchctl print system/com.lightpath.awdl-guard >/dev/null 2>&1; then
+        say "Wi-Fi helper is up to date."
+    else
+        say "Installing the Wi-Fi helper…"
+        as_root mkdir -p "$LIBEXEC"
+        as_root install -m 755 "$WORK/awdl-guard" "$WORK/lightpath-wake" "$LIBEXEC/"
+        as_root xattr -d com.apple.quarantine "$LIBEXEC/awdl-guard" "$LIBEXEC/lightpath-wake" 2>/dev/null || true
+        as_root install -o root -g wheel -m 644 "$WORK/awdl-guard.plist" "$PLIST"
+        as_root launchctl bootout system/com.lightpath.awdl-guard 2>/dev/null || true
+        as_root launchctl bootstrap system "$PLIST"
+    fi
 else
     warn "Helper binaries aren't published yet; skipping the Wi-Fi helper for now."
 fi
@@ -149,6 +188,8 @@ defaults write "$D" keepawake -bool true
 defaults write "$D" quitAppAfter -bool false
 defaults write "$D" confwarnings -bool false
 defaults write "$D" mdns -bool true
+# Full screen: Cmd+Tab, Cmd+Space, Cmd+Q & co. go to the PC (the PC turns them into its shortcuts)
+defaults write "$D" capturesyskeys -int 1
 
 # ------------------------------------------------------------------ Lightpath.app (Dock/Spotlight)
 say "Creating the Lightpath app…"
@@ -179,4 +220,5 @@ printf '\n\033[1;32m✓ Lightpath is ready.\033[0m\n'
 echo "  • Open \"Lightpath\" (Spotlight or Applications) to stream your PC's desktop."
 echo "  • Open \"Lightpath Steam\" to go straight to Steam Big Picture."
 echo "  • Screen: ${W}x${H} at 120 Hz. Press Ctrl+Option+Shift+Q to stop streaming."
+echo "  • Mac shortcuts work on the PC (Cmd+C/V, Cmd+Tab, Option+arrows…), copy/paste is shared."
 [ "$PAIRED" = 1 ] || warn "Pairing didn't finish. Turn the PC on and run: lightpath pair"

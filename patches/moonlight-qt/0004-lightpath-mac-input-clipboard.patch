@@ -1,0 +1,1615 @@
+From 9756b8a6395df3008312410b57601514d3c317f1 Mon Sep 17 00:00:00 2001
+From: Shreyansh Kaushik <smkaushi@ucsc.edu>
+Date: Tue, 17 Nov 2026 07:21:00 -0800
+Subject: [PATCH] macOS: native trackpad, Cmd shortcuts and shared clipboard
+ for Lightpath hosts
+
+Keyboard
+- Always send Cmd (and the Meta modifier) so the host can map Mac shortcuts
+  (Cmd+C, Cmd+Tab, ...) to Linux ones; /launch and /resume carry
+  lightpathClient=mac so the host knows to.
+- While the keyboard is captured, swap in an empty main menu so Cmd+Q, Cmd+H,
+  Cmd+W, Cmd+M reach the host instead of quitting or hiding Moonlight
+  (re-applied before each Cmd key in case Qt reinstalls its menu).
+
+Trackpad (AppKit event monitor, main thread)
+- Precise scrolling (trackpad, Magic Mouse) is sent 1:1 as 12 units per
+  point, unclamped, including macOS momentum, split into int16 chunks; mouse
+  wheel notches become 60 points.
+- Pinch = Ctrl+wheel steps, two-finger double tap = Ctrl+0, three-finger page
+  swipe = Cmd+[ / Cmd+] (the host maps them to Back/Forward). macOS
+  Spaces/Mission Control gestures untouched.
+
+Clipboard
+- Synced when moving between Mac and stream (no polling): the Mac copy is
+  sent when the stream window gains focus, the PC copy fetched when it loses
+  focus and when the stream ends (waits at most 500 ms). Text and images
+  (PNG, TIFF converted), up to 16 MiB, over the paired HTTPS channel
+  (GET/POST /lightpath/clipboard, new POST support in NvHTTP). Transfers run
+  in order on one worker thread; echo suppression, stale-result and
+  "Mac copied meanwhile" checks; hosts answering 404 turn it off.
+
+Pure logic lives in trackpad.h / ClipboardSyncState with a standalone test
+(tests/lightpath/lightpath_input_test.cpp).
+
+Claude-Session: https://claude.ai/code/session_01JSGYnegbZ8CEyDK2p2YTH2
+---
+ app/app.pro                              |   9 +-
+ app/backend/nvhttp.cpp                   |  56 +++-
+ app/backend/nvhttp.h                     |  13 +-
+ app/streaming/clipboardsync.h            | 134 +++++++++
+ app/streaming/clipboardsync_mac.mm       | 360 +++++++++++++++++++++++
+ app/streaming/input/input.cpp            |   4 +
+ app/streaming/input/input.h              |  23 ++
+ app/streaming/input/keyboard.cpp         |  10 +
+ app/streaming/input/macinput.h           |  22 ++
+ app/streaming/input/macinput_mac.mm      | 135 +++++++++
+ app/streaming/input/mouse.cpp            | 117 ++++++++
+ app/streaming/input/trackpad.h           | 178 +++++++++++
+ app/streaming/session.cpp                |  13 +
+ tests/lightpath/lightpath_input_test.cpp | 245 +++++++++++++++
+ 14 files changed, 1313 insertions(+), 6 deletions(-)
+ create mode 100644 app/streaming/clipboardsync.h
+ create mode 100644 app/streaming/clipboardsync_mac.mm
+ create mode 100644 app/streaming/input/macinput.h
+ create mode 100644 app/streaming/input/macinput_mac.mm
+ create mode 100644 app/streaming/input/trackpad.h
+ create mode 100644 tests/lightpath/lightpath_input_test.cpp
+
+diff --git a/app/app.pro b/app/app.pro
+index 52abab5..fa3c3d2 100644
+--- a/app/app.pro
++++ b/app/app.pro
+@@ -412,10 +412,15 @@ macx {
+         streaming/video/ffmpeg-renderers/vt_base.mm \
+         streaming/video/ffmpeg-renderers/vt_avsamplelayer.mm \
+         streaming/video/ffmpeg-renderers/vt_metal.mm \
+-        streaming/streamactivity_mac.mm
++        streaming/streamactivity_mac.mm \
++        streaming/clipboardsync_mac.mm \
++        streaming/input/macinput_mac.mm
+ 
+     HEADERS += \
+-        streaming/video/ffmpeg-renderers/vt.h
++        streaming/video/ffmpeg-renderers/vt.h \
++        streaming/clipboardsync.h \
++        streaming/input/macinput.h \
++        streaming/input/trackpad.h
+ }
+ discord-rpc {
+     message(Discord integration enabled)
+diff --git a/app/backend/nvhttp.cpp b/app/backend/nvhttp.cpp
+index 13ec4c4..5e0b6e4 100644
+--- a/app/backend/nvhttp.cpp
++++ b/app/backend/nvhttp.cpp
+@@ -234,7 +234,12 @@ NvHTTP::startApp(QString verb,
+                                    "&remoteControllersBitmap="+QString::number(gamepadMask)+
+                                    "&gcmap="+QString::number(gamepadMask)+
+                                    "&gcpersist="+QString::number(persistGameControllersOnDisconnect ? 1 : 0)+
+-                                   LiGetLaunchUrlQueryParameters(),
++                                   LiGetLaunchUrlQueryParameters()
++#ifdef Q_OS_DARWIN
++                                   // Lightpath: lets a Lightpath host translate Mac shortcuts (Cmd+C, ...)
++                                   +"&lightpathClient=mac"
++#endif
++                                   ,
+                                    LAUNCH_TIMEOUT_MS);
+ 
+     qInfo() << "Launch response:" << response;
+@@ -388,6 +393,38 @@ NvHTTP::verifyResponseStatus(QString xml)
+     throw GfeHttpResponseException(-1, "Malformed XML (missing root element)");
+ }
+ 
++bool
++NvHTTP::getLightpathClipboard(QByteArray& data, QString& contentType, quint64& seq, int timeoutMs)
++{
++    QNetworkReply* reply = openConnection(m_BaseUrlHttps,
++                                          "lightpath/clipboard",
++                                          nullptr,
++                                          timeoutMs,
++                                          NvLogLevel::NVLL_ERROR);
++    bool hasData = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt() == 200;
++    if (hasData) {
++        data = reply->readAll();
++        contentType = reply->header(QNetworkRequest::ContentTypeHeader).toString();
++        seq = reply->rawHeader("X-Lightpath-Clipboard-Seq").toULongLong();
++    }
++    delete reply;
++
++    return hasData;
++}
++
++void
++NvHTTP::setLightpathClipboard(const QByteArray& data, const QString& contentType, int timeoutMs)
++{
++    QNetworkReply* reply = openConnection(m_BaseUrlHttps,
++                                          "lightpath/clipboard",
++                                          nullptr,
++                                          timeoutMs,
++                                          NvLogLevel::NVLL_ERROR,
++                                          &data,
++                                          contentType);
++    delete reply;
++}
++
+ QImage
+ NvHTTP::getBoxArt(int appId)
+ {
+@@ -483,7 +520,9 @@ NvHTTP::openConnection(QUrl baseUrl,
+                        QString command,
+                        QString arguments,
+                        int timeoutMs,
+-                       NvLogLevel logLevel)
++                       NvLogLevel logLevel,
++                       const QByteArray* postData,
++                       const QString& postContentType)
+ {
+     // Port must be set
+     Q_ASSERT(baseUrl.port(0) != 0);
+@@ -518,7 +557,14 @@ NvHTTP::openConnection(QUrl baseUrl,
+ #endif
+ 
+     auto sslErrorsConnection = connect(m_Nam, &QNetworkAccessManager::sslErrors, this, &NvHTTP::handleSslErrors);
+-    QNetworkReply* reply = m_Nam->get(request);
++    QNetworkReply* reply;
++    if (postData != nullptr) {
++        request.setHeader(QNetworkRequest::ContentTypeHeader, postContentType);
++        reply = m_Nam->post(request, *postData);
++    }
++    else {
++        reply = m_Nam->get(request);
++    }
+     QEventLoop loop;
+ 
+     // Connect the quit signals
+@@ -545,6 +591,10 @@ NvHTTP::openConnection(QUrl baseUrl,
+         }
+     });
+     connect(reply, &QNetworkReply::requestSent, connectTimer, &QTimer::stop);
++    if (postData != nullptr) {
++        // A large upload is connected once its body starts flowing
++        connect(reply, &QNetworkReply::uploadProgress, connectTimer, &QTimer::stop);
++    }
+     connectTimer->start(REQUEST_TIMEOUT_MS);
+ #endif
+ 
+diff --git a/app/backend/nvhttp.h b/app/backend/nvhttp.h
+index ea70780..67c52a2 100644
+--- a/app/backend/nvhttp.h
++++ b/app/backend/nvhttp.h
+@@ -182,6 +182,15 @@ public:
+     QVector<NvDisplayMode>
+     getDisplayModeList(QString serverInfo);
+ 
++    // Lightpath: clipboard sync with a Lightpath host over the paired HTTPS channel.
++    // getLightpathClipboard() returns false when the host clipboard is empty (204).
++    // Both throw like the other requests (a host without clipboard sync answers 404).
++    bool
++    getLightpathClipboard(QByteArray& data, QString& contentType, quint64& seq, int timeoutMs);
++
++    void
++    setLightpathClipboard(const QByteArray& data, const QString& contentType, int timeoutMs);
++
+     QUrl m_BaseUrlHttp;
+     QUrl m_BaseUrlHttps;
+ private:
+@@ -193,7 +202,9 @@ private:
+                    QString command,
+                    QString arguments,
+                    int timeoutMs,
+-                   NvLogLevel logLevel);
++                   NvLogLevel logLevel,
++                   const QByteArray* postData = nullptr,
++                   const QString& postContentType = QString());
+ 
+     NvAddress m_Address;
+     QNetworkAccessManager* m_Nam;
+diff --git a/app/streaming/clipboardsync.h b/app/streaming/clipboardsync.h
+new file mode 100644
+index 0000000..2ee2195
+--- /dev/null
++++ b/app/streaming/clipboardsync.h
+@@ -0,0 +1,134 @@
++#pragma once
++
++// Lightpath: shared clipboard between the Mac and a Lightpath host, synced at the moments
++// the user moves between them (no polling):
++//  - the stream window gains focus (and once at stream start): a new Mac copy is sent to the PC
++//  - the stream window loses focus, and when the stream ends: a new PC copy is brought to the Mac
++// Transfers use the paired HTTPS channel (GET/POST /lightpath/clipboard). Hosts without the
++// endpoint (404) simply turn the feature off for the stream.
++
++#include <cstddef>
++#include <cstdint>
++
++class NvComputer;
++
++#ifdef __APPLE__
++void ClipboardSync_Begin(NvComputer* computer);
++void ClipboardSync_FocusChanged(bool focused);
++void ClipboardSync_End();
++#else
++static inline void ClipboardSync_Begin(NvComputer*) {}
++static inline void ClipboardSync_FocusChanged(bool) {}
++static inline void ClipboardSync_End() {}
++#endif
++
++// Pure bookkeeping (main thread only) that keeps both sides from echoing each other's
++// copies back and stops stale or reordered transfers from overwriting newer ones.
++class ClipboardSyncState
++{
++public:
++    static constexpr size_t kMaxBytes = 16 * 1024 * 1024;
++
++    // FNV-1a over the content type and bytes
++    static uint64_t contentHash(const char* type, const void* data, size_t length)
++    {
++        uint64_t hash = 0xcbf29ce484222325ULL;
++        auto mix = [&hash](const unsigned char* p, size_t n) {
++            for (size_t i = 0; i < n; i++) {
++                hash ^= p[i];
++                hash *= 0x100000001b3ULL;
++            }
++        };
++        for (const char* c = type; c != nullptr && *c != 0; c++) {
++            mix((const unsigned char*)c, 1);
++        }
++        mix((const unsigned char*)"\0", 1);
++        mix((const unsigned char*)data, length);
++        return hash;
++    }
++
++    // Mac -> PC: does the pasteboard hold something the PC hasn't seen yet?
++    bool shouldPush(long changeCount) const
++    {
++        return !m_HaveChangeCount || changeCount != m_SyncedChangeCount;
++    }
++
++    // Records that this pasteboard state is being handled (sent, or skipped as empty/too big),
++    // so it isn't sent again on the next focus change.
++    void markPushStarted(long changeCount)
++    {
++        m_HaveChangeCount = true;
++        m_SyncedChangeCount = changeCount;
++    }
++
++    // The host now holds this content (transfers complete in order).
++    void markPushSucceeded(uint64_t hash)
++    {
++        m_HaveHash = true;
++        m_SyncedHash = hash;
++    }
++
++    // The transfer failed: try again on the next focus change unless the Mac copied again.
++    void markPushFailed(long changeCount)
++    {
++        if (m_HaveChangeCount && m_SyncedChangeCount == changeCount) {
++            m_HaveChangeCount = false;
++        }
++    }
++
++    // PC -> Mac: each pull gets an increasing ticket; only the newest result may be applied.
++    uint64_t nextPullTicket()
++    {
++        return ++m_LastPullTicket;
++    }
++
++    // Decides whether host content fetched with `ticket` should be written to the Mac.
++    // `changeCountAtPull` is the pasteboard change count when the pull was requested.
++    bool acceptHostContent(uint64_t ticket, uint64_t seq, uint64_t hash,
++                           long changeCountAtPull, long currentChangeCount)
++    {
++        if (ticket <= m_LastAppliedTicket) {
++            // An older pull finishing after a newer one
++            return false;
++        }
++        m_LastAppliedTicket = ticket;
++
++        if (currentChangeCount != changeCountAtPull) {
++            // The user copied something on the Mac meanwhile; that copy wins
++            return false;
++        }
++
++        if (m_HaveSeq && seq == m_LastSeq) {
++            // The host clipboard hasn't changed since we last looked
++            return false;
++        }
++        m_HaveSeq = true;
++        m_LastSeq = seq;
++
++        if (m_HaveHash && hash == m_SyncedHash) {
++            // Our own push coming back, or identical content
++            return false;
++        }
++
++        return true;
++    }
++
++    // Records that host content was written to the pasteboard (now at `newChangeCount`).
++    void markApplied(long newChangeCount, uint64_t hash)
++    {
++        m_HaveChangeCount = true;
++        m_SyncedChangeCount = newChangeCount;
++        m_HaveHash = true;
++        m_SyncedHash = hash;
++    }
++
++private:
++    bool m_HaveChangeCount = false;
++    long m_SyncedChangeCount = 0;
++    bool m_HaveHash = false;
++    uint64_t m_SyncedHash = 0;
++    bool m_HaveSeq = false;
++    uint64_t m_LastSeq = 0;
++    uint64_t m_LastPullTicket = 0;
++    uint64_t m_LastAppliedTicket = 0;
++};
+diff --git a/app/streaming/clipboardsync_mac.mm b/app/streaming/clipboardsync_mac.mm
+new file mode 100644
+index 0000000..d2d84f0
+--- /dev/null
++++ b/app/streaming/clipboardsync_mac.mm
+@@ -0,0 +1,360 @@
++#import <AppKit/AppKit.h>
++
++#include "clipboardsync.h"
++#include "backend/nvcomputer.h"
++#include "backend/nvhttp.h"
++
++#include "SDL_compat.h"
++
++#include <QMutex>
++#include <QReadLocker>
++#include <QSemaphore>
++#include <QThreadPool>
++
++#include <functional>
++#include <memory>
++
++namespace {
++
++const char* const kTextType = "text/plain;charset=utf-8";
++const char* const kPngType = "image/png";
++
++const int kPushTimeoutMs = 30000;
++const int kPullTimeoutMs = 10000;
++const int kFinalPullWaitMs = 500;
++
++// TIFF screenshots shrink a lot as PNG, so allow more before converting
++const qsizetype kMaxTiffBytes = 4 * (qsizetype)ClipboardSyncState::kMaxBytes;
++
++struct HostTarget
++{
++    NvAddress address;
++    uint16_t httpsPort = 0;
++    QSslCertificate serverCert;
++    bool useTrueUid = true;
++};
++
++struct PullResult
++{
++    bool hasData = false;
++    bool unsupported = false;
++    quint64 seq = 0;
++    QByteArray data;
++    QString type;
++};
++
++// Main thread state
++bool s_Active = false;
++bool s_HostSupported = false;
++HostTarget s_Host;
++ClipboardSyncState s_State;
++
++// One worker, so transfers run in order and a pull never overtakes a push
++QThreadPool* transferPool()
++{
++    static QThreadPool* pool = [] {
++        QThreadPool* p = new QThreadPool();
++        p->setMaxThreadCount(1);
++        return p;
++    }();
++    return pool;
++}
++
++void runOnMainThread(std::function<void()> fn)
++{
++    dispatch_async_f(dispatch_get_main_queue(), new std::function<void()>(std::move(fn)), [](void* context) {
++        auto fn = static_cast<std::function<void()>*>(context);
++        (*fn)();
++        delete fn;
++    });
++}
++
++uint64_t hashOf(const QByteArray& data, const QString& type)
++{
++    QByteArray typeUtf8 = type.toUtf8();
++    return ClipboardSyncState::contentHash(typeUtf8.constData(), data.constData(), (size_t)data.size());
++}
++
++bool isNotFound(const QtNetworkReplyException& e)
++{
++    return e.getError() == QNetworkReply::ContentNotFoundError;
++}
++
++void handleUnsupportedHost()
++{
++    if (s_HostSupported) {
++        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                    "Lightpath clipboard: host doesn't support clipboard sync");
++        s_HostSupported = false;
++    }
++}
++
++void applyHostClipboard(uint64_t ticket, long changeCountAtPull, const PullResult& result)
++{
++    if (result.unsupported) {
++        handleUnsupportedHost();
++        return;
++    }
++    if (!result.hasData || result.data.isEmpty() || (size_t)result.data.size() > ClipboardSyncState::kMaxBytes) {
++        return;
++    }
++
++    bool isText = result.type.startsWith("text/plain", Qt::CaseInsensitive);
++    bool isPng = result.type.startsWith(kPngType, Qt::CaseInsensitive);
++    if (!isText && !isPng) {
++        return;
++    }
++
++    @autoreleasepool {
++        NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
++        uint64_t hash = hashOf(result.data, isText ? kTextType : kPngType);
++        if (!s_State.acceptHostContent(ticket, result.seq, hash, changeCountAtPull, (long)pasteboard.changeCount)) {
++            return;
++        }
++
++        if (isText) {
++            NSString* text = [[[NSString alloc] initWithData:result.data.toNSData()
++                                                    encoding:NSUTF8StringEncoding] autorelease];
++            if (text == nil) {
++                return;
++            }
++            [pasteboard clearContents];
++            [pasteboard setString:text forType:NSPasteboardTypeString];
++        }
++        else {
++            NSData* png = result.data.toNSData();
++            NSBitmapImageRep* image = [NSBitmapImageRep imageRepWithData:png];
++            if (image == nil) {
++                return;
++            }
++            // PNG for modern apps, TIFF for the ones that only take the classic type
++            [pasteboard clearContents];
++            [pasteboard setData:png forType:NSPasteboardTypePNG];
++            NSData* tiff = [image TIFFRepresentation];
++            if (tiff != nil) {
++                [pasteboard setData:tiff forType:NSPasteboardTypeTIFF];
++            }
++        }
++
++        s_State.markApplied((long)pasteboard.changeCount, hash);
++    }
++
++    SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                "Lightpath clipboard: copied %s from the host (%lld bytes)",
++                isText ? "text" : "an image", (long long)result.data.size());
++}
++
++PullResult fetchHostClipboard(const HostTarget& host, int timeoutMs)
++{
++    PullResult result;
++    try {
++        NvHTTP http(host.address, host.httpsPort, host.serverCert, host.useTrueUid);
++        result.hasData = http.getLightpathClipboard(result.data, result.type, result.seq, timeoutMs);
++    } catch (const QtNetworkReplyException& e) {
++        result.unsupported = isNotFound(e);
++        if (!result.unsupported) {
++            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                        "Lightpath clipboard: fetching from the host failed: %s",
++                        e.what());
++        }
++    } catch (const GfeHttpResponseException& e) {
++        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                    "Lightpath clipboard: fetching from the host failed: %s",
++                    e.what());
++    }
++    return result;
++}
++
++// Shared between the final pull and the main thread waiting (briefly) for it
++struct FinalPull
++{
++    QMutex lock;
++    QSemaphore done;
++    bool finished = false;
++    bool abandoned = false;
++    PullResult result;
++};
++
++void pullHostClipboard(std::shared_ptr<FinalPull> finalPull = nullptr)
++{
++    if (!s_HostSupported) {
++        return;
++    }
++
++    uint64_t ticket = s_State.nextPullTicket();
++    long changeCountAtPull = (long)[NSPasteboard generalPasteboard].changeCount;
++    HostTarget host = s_Host;
++
++    transferPool()->start([=]() {
++        PullResult result = fetchHostClipboard(host, finalPull ? kFinalPullWaitMs : kPullTimeoutMs);
++
++        if (finalPull) {
++            QMutexLocker locker(&finalPull->lock);
++            finalPull->result = result;
++            finalPull->finished = true;
++            if (finalPull->abandoned) {
++                // The main thread stopped waiting; apply whenever it's free again
++                runOnMainThread([=]() { applyHostClipboard(ticket, changeCountAtPull, result); });
++            }
++            finalPull->done.release();
++            return;
++        }
++
++        runOnMainThread([=]() { applyHostClipboard(ticket, changeCountAtPull, result); });
++    });
++
++    if (finalPull) {
++        if (!finalPull->done.tryAcquire(1, kFinalPullWaitMs)) {
++            QMutexLocker locker(&finalPull->lock);
++            if (!finalPull->finished) {
++                finalPull->abandoned = true;
++                return;
++            }
++        }
++        applyHostClipboard(ticket, changeCountAtPull, finalPull->result);
++    }
++}
++
++void pushMacClipboard()
++{
++    if (!s_HostSupported) {
++        return;
++    }
++
++    NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
++    long changeCount = (long)pasteboard.changeCount;
++    if (!s_State.shouldPush(changeCount)) {
++        return;
++    }
++    s_State.markPushStarted(changeCount);
++
++    QByteArray data;
++    QString type;
++    bool needsPngConversion = false;
++    @autoreleasepool {
++        NSString* text = [pasteboard stringForType:NSPasteboardTypeString];
++        NSData* image;
++        if (text != nil) {
++            data = QByteArray::fromNSData([text dataUsingEncoding:NSUTF8StringEncoding]);
++            type = kTextType;
++        }
++        else if ((image = [pasteboard dataForType:NSPasteboardTypePNG]) != nil) {
++            data = QByteArray::fromNSData(image);
++            type = kPngType;
++        }
++        else if ((image = [pasteboard dataForType:NSPasteboardTypeTIFF]) != nil && (qsizetype)image.length <= kMaxTiffBytes) {
++            data = QByteArray::fromNSData(image);
++            type = kPngType;
++            needsPngConversion = true;
++        }
++    }
++
++    if (data.isEmpty()) {
++        // Nothing we can share (files, other formats, or an empty pasteboard)
++        return;
++    }
++
++    HostTarget host = s_Host;
++    transferPool()->start([=]() mutable {
++        if (needsPngConversion) {
++            @autoreleasepool {
++                NSBitmapImageRep* image = [NSBitmapImageRep imageRepWithData:data.toRawNSData()];
++                NSData* png = [image representationUsingType:NSBitmapImageFileTypePNG properties:@{}];
++                data = png != nil ? QByteArray::fromNSData(png) : QByteArray();
++            }
++        }
++
++        if (data.isEmpty() || (size_t)data.size() > ClipboardSyncState::kMaxBytes) {
++            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                        "Lightpath clipboard: not sending %lld bytes (limit %zu)",
++                        (long long)data.size(), ClipboardSyncState::kMaxBytes);
++            return;
++        }
++
++        uint64_t hash = hashOf(data, type);
++        bool sent = false;
++        bool unsupported = false;
++        try {
++            NvHTTP http(host.address, host.httpsPort, host.serverCert, host.useTrueUid);
++            http.setLightpathClipboard(data, type, kPushTimeoutMs);
++            sent = true;
++        } catch (const QtNetworkReplyException& e) {
++            unsupported = isNotFound(e);
++            if (!unsupported) {
++                SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                            "Lightpath clipboard: sending to the host failed: %s",
++                            e.what());
++            }
++        } catch (const GfeHttpResponseException& e) {
++            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                        "Lightpath clipboard: sending to the host failed: %s",
++                        e.what());
++        }
++
++        if (sent) {
++            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
++                        "Lightpath clipboard: sent %s to the host (%lld bytes)",
++                        type == kTextType ? "text" : "an image", (long long)data.size());
++        }
++
++        runOnMainThread([=]() {
++            if (sent) {
++                s_State.markPushSucceeded(hash);
++            }
++            else {
++                s_State.markPushFailed(changeCount);
++                if (unsupported) {
++                    handleUnsupportedHost();
++                }
++            }
++        });
++    });
++}
++
++}
++
++void ClipboardSync_Begin(NvComputer* computer)
++{
++    if (computer == nullptr) {
++        return;
++    }
++
++    {
++        QReadLocker lock(&computer->lock);
++        s_Host.address = computer->activeAddress;
++        s_Host.httpsPort = computer->activeHttpsPort;
++        s_Host.serverCert = computer->serverCert;
++        s_Host.useTrueUid = !computer->isNvidiaServerSoftware;
++    }
++
++    // Needs the paired HTTPS channel
++    s_HostSupported = !s_Host.address.isNull() && s_Host.httpsPort != 0 && !s_Host.serverCert.isNull();
++    s_Active = true;
++
++    pushMacClipboard();
++}
++
++void ClipboardSync_FocusChanged(bool focused)
++{
++    if (!s_Active) {
++        return;
++    }
++
++    if (focused) {
++        pushMacClipboard();
++    }
++    else {
++        pullHostClipboard();
++    }
++}
++
++void ClipboardSync_End()
++{
++    if (!s_Active) {
++        return;
++    }
++    s_Active = false;
++
++    // Bring over anything copied on the PC before the stream goes away
++    pullHostClipboard(std::make_shared<FinalPull>());
++}
+diff --git a/app/streaming/input/input.cpp b/app/streaming/input/input.cpp
+index 2597f99..4265ec6 100644
+--- a/app/streaming/input/input.cpp
++++ b/app/streaming/input/input.cpp
+@@ -1,6 +1,7 @@
+ #include <Limelight.h>
+ #include "SDL_compat.h"
+ #include "streaming/session.h"
++#include "macinput.h"
+ #include "settings/mappingmanager.h"
+ #include "path.h"
+ #include "utils.h"
+@@ -321,6 +322,9 @@ void SdlInputHandler::updateKeyboardGrabState()
+ #endif
+ 
+     m_KeyboardCaptureActive = shouldGrab;
++
++    // Lightpath: while the keyboard is captured, Cmd shortcuts belong to the host
++    MacInput_SetMenuShortcutsSuppressed(shouldGrab);
+ }
+ 
+ bool SdlInputHandler::isSystemKeyCaptureActive()
+diff --git a/app/streaming/input/input.h b/app/streaming/input/input.h
+index 8113316..74a1b36 100644
+--- a/app/streaming/input/input.h
++++ b/app/streaming/input/input.h
+@@ -5,6 +5,10 @@
+ 
+ #include "SDL_compat.h"
+ 
++#ifdef Q_OS_DARWIN
++#include "trackpad.h"
++#endif
++
+ struct GamepadState {
+     SDL_GameController* controller;
+     SDL_JoystickID jsId;
+@@ -152,6 +156,18 @@ public:
+ 
+     void updatePointerRegionLock();
+ 
++#ifdef Q_OS_DARWIN
++    // Lightpath: macOS trackpad input taken straight from AppKit (see macinput_mac.mm).
++    // Each returns false when the event isn't meant for the stream.
++    bool handlePreciseScroll(float scrollingDeltaX, float scrollingDeltaY);
++
++    bool handleMagnify(float magnification, bool gestureEnded);
++
++    bool handleSmartMagnify();
++
++    bool handleSwipe(float deltaX);
++#endif
++
+     static
+     QString getUnmappedGamepads();
+ 
+@@ -203,6 +219,13 @@ private:
+     static
+     Uint32 dragTimerCallback(Uint32 interval, void* param);
+ 
++#ifdef Q_OS_DARWIN
++    bool isTrackpadTargetingStream();
++
++    Trackpad::PreciseScroll m_PreciseScroll;
++    Trackpad::PinchAccumulator m_Pinch;
++#endif
++
+     SDL_Window* m_Window;
+     bool m_MultiController;
+     bool m_GamepadMouse;
+diff --git a/app/streaming/input/keyboard.cpp b/app/streaming/input/keyboard.cpp
+index 29e218d..96c5697 100644
+--- a/app/streaming/input/keyboard.cpp
++++ b/app/streaming/input/keyboard.cpp
+@@ -238,9 +238,15 @@ void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
+         modifiers |= MODIFIER_SHIFT;
+     }
+     if (event->keysym.mod & KMOD_GUI) {
++#ifdef Q_OS_DARWIN
++        // Lightpath: Cmd is the Mac's main shortcut key, so always send it. The host
++        // translates Cmd shortcuts (Cmd+C, Cmd+Tab, ...) to their Linux equivalents.
++        modifiers |= MODIFIER_META;
++#else
+         if (isSystemKeyCaptureActive()) {
+             modifiers |= MODIFIER_META;
+         }
++#endif
+     }
+ 
+     // Set keycode. We explicitly use scancode here because GFE will try to correct
+@@ -399,16 +405,20 @@ void SdlInputHandler::handleKeyEvent(SDL_KeyboardEvent* event)
+                 modifiers |= MODIFIER_EXTENDED;
+                 break;
+             case SDL_SCANCODE_LGUI:
++#ifndef Q_OS_DARWIN
+                 if (!isSystemKeyCaptureActive()) {
+                     return;
+                 }
++#endif
+                 keyCode = 0x5B;
+                 modifiers |= MODIFIER_EXTENDED;
+                 break;
+             case SDL_SCANCODE_RGUI:
++#ifndef Q_OS_DARWIN
+                 if (!isSystemKeyCaptureActive()) {
+                     return;
+                 }
++#endif
+                 keyCode = 0x5C;
+                 modifiers |= MODIFIER_EXTENDED;
+                 break;
+diff --git a/app/streaming/input/macinput.h b/app/streaming/input/macinput.h
+new file mode 100644
+index 0000000..a77b8a9
+--- /dev/null
++++ b/app/streaming/input/macinput.h
+@@ -0,0 +1,22 @@
++#pragma once
++
++// Lightpath: macOS-native trackpad input and Cmd shortcuts while streaming.
++//  - Precise scrolling (trackpad, Magic Mouse) goes 1:1 to the host, including momentum
++//  - Pinch zooms (Ctrl+wheel), a two-finger double tap resets zoom (Ctrl+0)
++//  - A three-finger page swipe goes Back/Forward (Alt+Left/Right)
++//  - While the keyboard is captured, Moonlight's menu stops claiming Cmd+Q/H/W/M... so those
++//    reach the host too. macOS Spaces/Mission Control gestures are left alone, so the user
++//    can always swipe out of the stream.
++
++struct SDL_Window;
++class SdlInputHandler;
++
++#ifdef __APPLE__
++void MacInput_Begin(SDL_Window* window, SdlInputHandler* inputHandler);
++void MacInput_End();
++void MacInput_SetMenuShortcutsSuppressed(bool suppressed);
++#else
++static inline void MacInput_Begin(SDL_Window*, SdlInputHandler*) {}
++static inline void MacInput_End() {}
++static inline void MacInput_SetMenuShortcutsSuppressed(bool) {}
++#endif
+diff --git a/app/streaming/input/macinput_mac.mm b/app/streaming/input/macinput_mac.mm
+new file mode 100644
+index 0000000..554a263
+--- /dev/null
++++ b/app/streaming/input/macinput_mac.mm
+@@ -0,0 +1,135 @@
++#import <AppKit/AppKit.h>
++
++#include "macinput.h"
++#include "input.h"
++
++#include <SDL_syswm.h>
++
++// All state is touched on the main thread only (AppKit event monitors run there too).
++static id s_EventMonitor = nil;
++static NSWindow* s_StreamWindow = nil; // not retained, only compared against
++static SdlInputHandler* s_InputHandler = nullptr;
++static bool s_SuppressMenuShortcuts = false;
++static NSMenu* s_SavedMainMenu = nil;
++static NSMenu* s_EmptyMainMenu = nil;
++
++// AppKit gives the main menu the first look at every Cmd key, so Moonlight's menu would quit
++// (Cmd+Q) or hide (Cmd+H) instead of the PC getting the shortcut. SDL has already seen the
++// key by then, so an empty main menu is all it takes to pass it through.
++static void applyMenuSuppression()
++{
++    if (s_SuppressMenuShortcuts) {
++        if (s_EmptyMainMenu == nil) {
++            s_EmptyMainMenu = [[NSMenu alloc] initWithTitle:@""];
++        }
++
++        NSMenu* current = [NSApp mainMenu];
++        if (current != s_EmptyMainMenu) {
++            // Keep whatever menu is current; Qt may have installed a newer one meanwhile
++            [current retain];
++            [s_SavedMainMenu release];
++            s_SavedMainMenu = current;
++            [NSApp setMainMenu:s_EmptyMainMenu];
++        }
++    }
++    else if (s_EmptyMainMenu != nil) {
++        // Only undo our own swap
++        if ([NSApp mainMenu] == s_EmptyMainMenu) {
++            [NSApp setMainMenu:s_SavedMainMenu];
++        }
++
++        [s_SavedMainMenu release];
++        s_SavedMainMenu = nil;
++        [s_EmptyMainMenu release];
++        s_EmptyMainMenu = nil;
++    }
++}
++
++static void removeEventMonitor()
++{
++    if (s_EventMonitor != nil) {
++        [NSEvent removeMonitor:s_EventMonitor];
++        [s_EventMonitor release];
++        s_EventMonitor = nil;
++    }
++
++    s_StreamWindow = nil;
++    s_InputHandler = nullptr;
++}
++
++void MacInput_Begin(SDL_Window* window, SdlInputHandler* inputHandler)
++{
++    // Keyboard capture (and with it the menu suppression) may already be active
++    removeEventMonitor();
++
++    SDL_SysWMinfo info;
++    SDL_VERSION(&info.version);
++    if (window == nullptr || inputHandler == nullptr ||
++            !SDL_GetWindowWMInfo(window, &info) || info.subsystem != SDL_SYSWM_COCOA) {
++        SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION,
++                    "Lightpath input: no Cocoa window, trackpad gestures disabled");
++        return;
++    }
++
++    s_StreamWindow = info.info.cocoa.window;
++    s_InputHandler = inputHandler;
++
++    // SDL turns trackpad scrolling into clamped wheel notches and drops pinch and swipe
++    // gestures, so take these events straight from AppKit. Scroll events this handles are
++    // consumed (SDL only generates wheel events when the window dispatches them).
++    NSEventMask mask = NSEventMaskScrollWheel | NSEventMaskMagnify |
++                       NSEventMaskSmartMagnify | NSEventMaskSwipe | NSEventMaskKeyDown;
++    s_EventMonitor = [[NSEvent addLocalMonitorForEventsMatchingMask:mask
++                                                            handler:^NSEvent*(NSEvent* event) {
++        if (event.type == NSEventTypeKeyDown) {
++            // Qt can reinstall its menu (e.g. when the app is reactivated), so make sure
++            // it's still out of the way before AppKit matches this key against it
++            if (event.modifierFlags & NSEventModifierFlagCommand) {
++                applyMenuSuppression();
++            }
++            return event;
++        }
++
++        if (s_InputHandler == nullptr || event.window != s_StreamWindow) {
++            return event;
++        }
++
++        switch (event.type) {
++        case NSEventTypeScrollWheel:
++            // Trackpads and Magic Mice report precise deltas in points, including the
++            // momentum phase after the fingers lift. Mouse wheels keep SDL's path.
++            if (event.hasPreciseScrollingDeltas &&
++                    s_InputHandler->handlePreciseScroll(event.scrollingDeltaX, event.scrollingDeltaY)) {
++                return nil;
++            }
++            return event;
++
++        case NSEventTypeMagnify:
++            s_InputHandler->handleMagnify(event.magnification,
++                                          event.phase == NSEventPhaseEnded ||
++                                          event.phase == NSEventPhaseCancelled);
++            return event;
++
++        case NSEventTypeSmartMagnify:
++            return s_InputHandler->handleSmartMagnify() ? nil : event;
++
++        case NSEventTypeSwipe:
++            return s_InputHandler->handleSwipe(event.deltaX) ? nil : event;
++
++        default:
++            return event;
++        }
++    }] retain];
++}
++
++void MacInput_End()
++{
++    removeEventMonitor();
++    MacInput_SetMenuShortcutsSuppressed(false);
++}
++
++void MacInput_SetMenuShortcutsSuppressed(bool suppressed)
++{
++    s_SuppressMenuShortcuts = suppressed;
++    applyMenuSuppression();
++}
+diff --git a/app/streaming/input/mouse.cpp b/app/streaming/input/mouse.cpp
+index c5bd1fd..09eb1ac 100644
+--- a/app/streaming/input/mouse.cpp
++++ b/app/streaming/input/mouse.cpp
+@@ -199,6 +199,20 @@ void SdlInputHandler::handleMouseWheelEvent(SDL_MouseWheelEvent* event)
+     }
+ 
+ #if SDL_VERSION_ATLEAST(2, 0, 18)
++#ifdef Q_OS_DARWIN
++    // Lightpath: trackpad scrolling arrives through macinput_mac.mm, so this is a mouse wheel.
++    // The host takes a Mac's scroll amounts as points; send each notch as 60 points.
++    Trackpad::ScrollAmounts amounts = Trackpad::wheelNotchAmounts(event->preciseX, event->preciseY,
++                                                                  m_ReverseScrollDirection);
++    Trackpad::sendScrollInChunks(amounts.vertical, [](short amount) {
++        LiSendHighResScrollEvent(amount);
++    });
++    Trackpad::sendScrollInChunks(amounts.horizontal, [](short amount) {
++        LiSendHighResHScrollEvent(amount);
++    });
++    return;
++#endif
++
+     if (event->preciseY != 0.0f) {
+         // Invert the scroll direction if needed
+         if (m_ReverseScrollDirection) {
+@@ -259,6 +273,109 @@ void SdlInputHandler::handleMouseWheelEvent(SDL_MouseWheelEvent* event)
+ #endif
+ }
+ 
++#ifdef Q_OS_DARWIN
++// Presses and releases vk while holding a modifier, exactly like a keyboard would
++static void sendModifiedKeyTap(short modifierVk, char modifierFlag, short vk, bool extended)
++{
++    char keyModifiers = modifierFlag | (extended ? MODIFIER_EXTENDED : 0);
++
++    LiSendKeyboardEvent2((short)(0x8000 | modifierVk), KEY_ACTION_DOWN, modifierFlag, 0);
++    LiSendKeyboardEvent2((short)(0x8000 | vk), KEY_ACTION_DOWN, keyModifiers, 0);
++    LiSendKeyboardEvent2((short)(0x8000 | vk), KEY_ACTION_UP, keyModifiers, 0);
++    LiSendKeyboardEvent2((short)(0x8000 | modifierVk), KEY_ACTION_UP, 0, 0);
++}
++
++bool SdlInputHandler::isTrackpadTargetingStream()
++{
++    if (!isCaptureActive()) {
++        return false;
++    }
++
++    if (m_AbsoluteMouseMode) {
++        int mouseX, mouseY;
++        SDL_GetMouseState(&mouseX, &mouseY);
++        if (!isMouseInVideoRegion(mouseX, mouseY)) {
++            return false;
++        }
++    }
++
++    return true;
++}
++
++bool SdlInputHandler::handlePreciseScroll(float scrollingDeltaX, float scrollingDeltaY)
++{
++    if (!isTrackpadTargetingStream()) {
++        return false;
++    }
++
++    // Unlike the SDL wheel path, nothing is clamped: fast flicks and the momentum macOS
++    // adds after the fingers lift carry through 1:1, like scrolling in a native app.
++    Trackpad::ScrollAmounts amounts = m_PreciseScroll.add(scrollingDeltaX, scrollingDeltaY, m_ReverseScrollDirection);
++    Trackpad::sendScrollInChunks(amounts.vertical, [](short amount) {
++        LiSendHighResScrollEvent(amount);
++    });
++    Trackpad::sendScrollInChunks(amounts.horizontal, [](short amount) {
++        LiSendHighResHScrollEvent(amount);
++    });
++
++    return true;
++}
++
++bool SdlInputHandler::handleMagnify(float magnification, bool gestureEnded)
++{
++    if (gestureEnded) {
++        m_Pinch.reset();
++        return true;
++    }
++
++    if (!isTrackpadTargetingStream()) {
++        return false;
++    }
++
++    // Pinch becomes Ctrl+wheel, which zooms in browsers, viewers and editors on the host
++    for (int steps = m_Pinch.add(magnification); steps != 0; steps += (steps > 0) ? -1 : 1) {
++        LiSendKeyboardEvent2((short)(0x8000 | 0xA2), KEY_ACTION_DOWN, MODIFIER_CTRL, 0);
++        LiSendScrollEvent(steps > 0 ? 1 : -1);
++        LiSendKeyboardEvent2((short)(0x8000 | 0xA2), KEY_ACTION_UP, 0, 0);
++    }
++
++    return true;
++}
++
++bool SdlInputHandler::handleSmartMagnify()
++{
++    if (!isTrackpadTargetingStream()) {
++        return false;
++    }
++
++    // Two-finger double tap: reset the zoom (Ctrl+0)
++    sendModifiedKeyTap(0xA2, MODIFIER_CTRL, 0x30, false);
++    return true;
++}
++
++bool SdlInputHandler::handleSwipe(float deltaX)
++{
++    if (!isTrackpadTargetingStream()) {
++        return false;
++    }
++
++    // Three-finger "swipe between pages": Cmd+[ is Back, Cmd+] is Forward
++    short vk = Trackpad::swipeShortcutKey(Trackpad::swipeActionForDeltaX(deltaX));
++    if (vk == 0) {
++        return false;
++    }
++
++    bool cmdHeld = (SDL_GetModState() & KMOD_GUI) != 0;
++    Trackpad::sendCmdShortcut(vk, cmdHeld, [](short key, bool down, bool meta, bool extended) {
++        LiSendKeyboardEvent2((short)(0x8000 | key),
++                             down ? KEY_ACTION_DOWN : KEY_ACTION_UP,
++                             (meta ? MODIFIER_META : 0) | (extended ? MODIFIER_EXTENDED : 0),
++                             0);
++    });
++    return true;
++}
++#endif
++
+ bool SdlInputHandler::isMouseInVideoRegion(int mouseX, int mouseY, int windowWidth, int windowHeight)
+ {
+     SDL_Rect src, dst;
+diff --git a/app/streaming/input/trackpad.h b/app/streaming/input/trackpad.h
+new file mode 100644
+index 0000000..46918c1
+--- /dev/null
++++ b/app/streaming/input/trackpad.h
+@@ -0,0 +1,178 @@
++#pragma once
++
++// Lightpath: pure helpers that turn macOS trackpad input into Moonlight input events.
++// Kept free of SDL/AppKit so they can be tested on their own (see tests/lightpath).
++
++#include <climits>
++#include <cmath>
++#include <cstdint>
++
++namespace Trackpad {
++
++// High-res wheel units per point of finger travel: 10 points = 120 = one wheel notch.
++constexpr float kScrollUnitsPerPoint = 12.0f;
++
++// Pinch magnification per discrete zoom step (Ctrl + one wheel notch on the host).
++constexpr float kPinchStep = 0.08f;
++
++// Converts precise scroll deltas (points, any size, including macOS momentum) into whole
++// high-res wheel units. The fractional remainder carries over, so slow scrolls add up
++// exactly and nothing is lost to rounding.
++class ScrollAccumulator
++{
++public:
++    int64_t add(float points)
++    {
++        m_Remainder += (double)points * kScrollUnitsPerPoint;
++        int64_t whole = (int64_t)m_Remainder; // toward zero
++        m_Remainder -= (double)whole;
++        return whole;
++    }
++
++    void reset()
++    {
++        m_Remainder = 0;
++    }
++
++private:
++    double m_Remainder = 0;
++};
++
++struct ScrollAmounts
++{
++    int64_t vertical;   // positive = scroll up (wheel away from the user)
++    int64_t horizontal; // positive = scroll right
++};
++
++// AppKit precise deltas -> wheel amounts. scrollingDeltaY > 0 already means "scroll up" in
++// the user's chosen direction (natural scrolling included); scrollingDeltaX > 0 means
++// "scroll left", hence the flip, matching SDL's convention for the same events.
++class PreciseScroll
++{
++public:
++    ScrollAmounts add(float scrollingDeltaX, float scrollingDeltaY, bool reverse)
++    {
++        if (reverse) {
++            scrollingDeltaX = -scrollingDeltaX;
++            scrollingDeltaY = -scrollingDeltaY;
++        }
++        return { m_Y.add(scrollingDeltaY), m_X.add(-scrollingDeltaX) };
++    }
++
++private:
++    ScrollAccumulator m_X;
++    ScrollAccumulator m_Y;
++};
++
++// A Lightpath host treats a Mac's scroll amounts as points (see kScrollUnitsPerPoint), so a
++// mouse wheel notch is sent as 60 points, about what one notch scrolls in a native Mac app.
++constexpr float kPointsPerWheelNotch = 60.0f;
++
++// SDL wheel values (notches; preciseY > 0 = up, preciseX > 0 = right) -> wheel amounts.
++// No clamping: macOS wheel acceleration is kept, like in native apps.
++inline ScrollAmounts wheelNotchAmounts(float preciseX, float preciseY, bool reverse)
++{
++    double scale = (double)kPointsPerWheelNotch * kScrollUnitsPerPoint * (reverse ? -1 : 1);
++    return { std::llround(preciseY * scale), std::llround(preciseX * scale) };
++}
++
++// The wire format carries a signed 16-bit amount per event; larger amounts are split.
++// SHRT_MIN is avoided so every chunk can be negated safely on the host.
++template <typename SendFn>
++void sendScrollInChunks(int64_t amount, SendFn send)
++{
++    while (amount != 0) {
++        int64_t chunk = amount;
++        if (chunk > SHRT_MAX) {
++            chunk = SHRT_MAX;
++        }
++        else if (chunk < -SHRT_MAX) {
++            chunk = -SHRT_MAX;
++        }
++        send((short)chunk);
++        amount -= chunk;
++    }
++}
++
++// Turns macOS magnification deltas into discrete zoom steps: positive = zoom in.
++class PinchAccumulator
++{
++public:
++    int add(float magnification)
++    {
++        m_Accumulated += magnification;
++        int steps = 0;
++        while (m_Accumulated >= kPinchStep) {
++            m_Accumulated -= kPinchStep;
++            steps++;
++        }
++        while (m_Accumulated <= -kPinchStep) {
++            m_Accumulated += kPinchStep;
++            steps--;
++        }
++        return steps;
++    }
++
++    void reset()
++    {
++        m_Accumulated = 0;
++    }
++
++private:
++    float m_Accumulated = 0;
++};
++
++// NSEventTypeSwipe (three-finger "swipe between pages"): deltaX > 0 is a left-to-right
++// swipe, which is Back in Safari and Chrome; deltaX < 0 is Forward.
++enum class SwipeAction
++{
++    None,
++    Back,
++    Forward,
++};
++
++inline SwipeAction swipeActionForDeltaX(float deltaX)
++{
++    if (deltaX > 0.5f) {
++        return SwipeAction::Back;
++    }
++    else if (deltaX < -0.5f) {
++        return SwipeAction::Forward;
++    }
++    return SwipeAction::None;
++}
++
++constexpr short kVkLeftWin = 0x5B;
++constexpr short kVkOpenBracket = 0xDB;
++constexpr short kVkCloseBracket = 0xDD;
++
++// Page swipes are sent as the Mac's own Back/Forward shortcuts, Cmd+[ and Cmd+], which a
++// Lightpath host turns into Alt+Left/Alt+Right. Returns 0 for no action.
++inline short swipeShortcutKey(SwipeAction action)
++{
++    switch (action) {
++    case SwipeAction::Back:
++        return kVkOpenBracket;
++    case SwipeAction::Forward:
++        return kVkCloseBracket;
++    default:
++        return 0;
++    }
++}
++
++// Sends Cmd+vk as key events: send(vk, down, meta, extended). If the user is already
++// holding Cmd, only the key itself is pressed so their Cmd isn't released under them.
++template <typename SendKeyFn>
++void sendCmdShortcut(short vk, bool cmdHeld, SendKeyFn send)
++{
++    if (!cmdHeld) {
++        send(kVkLeftWin, true, true, true);
++    }
++    send(vk, true, true, false);
++    send(vk, false, true, false);
++    if (!cmdHeld) {
++        send(kVkLeftWin, false, false, true);
++    }
++}
++
++}
+diff --git a/app/streaming/session.cpp b/app/streaming/session.cpp
+index 53a57f0..526e1a0 100644
+--- a/app/streaming/session.cpp
++++ b/app/streaming/session.cpp
+@@ -1,5 +1,7 @@
+ #include "session.h"
+ #include "streamactivity.h"
++#include "clipboardsync.h"
++#include "input/macinput.h"
+ 
+ #include <QHostAddress>
+ #include "settings/streamingpreferences.h"
+@@ -1966,6 +1968,10 @@ void Session::exec()
+ 
+     StreamActivity_Begin();
+ 
++    // Lightpath: native trackpad gestures and a shared clipboard on macOS
++    MacInput_Begin(m_Window, m_InputHandler);
++    ClipboardSync_Begin(m_Computer);
++
+     // Hide Qt's fake mouse cursor on EGLFS systems
+     if (QGuiApplication::platformName() == "eglfs") {
+         QGuiApplication::setOverrideCursor(QCursor(Qt::BlankCursor));
+@@ -2080,12 +2086,14 @@ void Session::exec()
+                     m_AudioMuted = true;
+                 }
+                 m_InputHandler->notifyFocusLost();
++                ClipboardSync_FocusChanged(false);
+                 break;
+             case SDL_WINDOWEVENT_FOCUS_GAINED:
+                 if (m_Preferences->muteOnFocusLoss) {
+                     m_AudioMuted = false;
+                 }
+                 m_InputHandler->notifyFocusGained();
++                ClipboardSync_FocusChanged(true);
+                 break;
+             case SDL_WINDOWEVENT_LEAVE:
+                 m_InputHandler->notifyMouseLeave();
+@@ -2351,6 +2359,11 @@ DispatchDeferredCleanup:
+         QGuiApplication::restoreOverrideCursor();
+     }
+ 
++    // Bring over the PC's last copy before the stream goes away, then remove the
++    // trackpad hooks while the input handler still exists
++    ClipboardSync_End();
++    MacInput_End();
++
+     StreamActivity_End();
+ 
+     // Raise any keys that are still down
+diff --git a/tests/lightpath/lightpath_input_test.cpp b/tests/lightpath/lightpath_input_test.cpp
+new file mode 100644
+index 0000000..214383c
+--- /dev/null
++++ b/tests/lightpath/lightpath_input_test.cpp
+@@ -0,0 +1,245 @@
++// Lightpath: standalone tests for the pure parts of the macOS trackpad and clipboard code.
++//   g++ -std=c++17 -Wall -Wextra -I app tests/lightpath/lightpath_input_test.cpp -o /tmp/lp_test && /tmp/lp_test
++
++#include "streaming/input/trackpad.h"
++#include "streaming/clipboardsync.h"
++
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++static int s_Failures = 0;
++
++#define CHECK(cond) \
++    do { \
++        if (!(cond)) { \
++            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); \
++            s_Failures++; \
++        } \
++    } while (0)
++
++static std::vector<short> chunksOf(int64_t amount)
++{
++    std::vector<short> chunks;
++    Trackpad::sendScrollInChunks(amount, [&chunks](short chunk) { chunks.push_back(chunk); });
++    return chunks;
++}
++
++static int64_t sumOf(const std::vector<short>& chunks)
++{
++    int64_t sum = 0;
++    for (short chunk : chunks) {
++        sum += chunk;
++    }
++    return sum;
++}
++
++static void testScrollUnits()
++{
++    // 10 points = one notch
++    Trackpad::ScrollAccumulator acc;
++    CHECK(acc.add(10.0f) == 120);
++    CHECK(acc.add(-10.0f) == -120);
++
++    // Tiny deltas add up instead of being rounded away: 100 x 0.05 pt = 5 pt = 60 units
++    Trackpad::ScrollAccumulator slow;
++    int64_t total = 0;
++    for (int i = 0; i < 100; i++) {
++        total += slow.add(0.05f);
++    }
++    CHECK(total >= 59 && total <= 60);
++    CHECK(slow.add(0.0f) == 0);
++
++    // A single sub-unit delta sends nothing yet, the next one carries it over
++    Trackpad::ScrollAccumulator carry;
++    CHECK(carry.add(0.05f) == 0); // 0.6 units
++    CHECK(carry.add(0.05f) == 1); // 1.2 units -> 1, 0.2 left
++    carry.reset();
++    CHECK(carry.add(0.05f) == 0);
++
++    // No clamping: a fast momentum flick of 400 points goes through in full
++    Trackpad::ScrollAccumulator fast;
++    CHECK(fast.add(400.0f) == 4800);
++}
++
++static void testScrollSigns()
++{
++    // Natural scrolling: fingers moving down => scrollingDeltaY > 0 => scroll up (positive)
++    Trackpad::PreciseScroll scroll;
++    Trackpad::ScrollAmounts a = scroll.add(0.0f, 10.0f, false);
++    CHECK(a.vertical == 120 && a.horizontal == 0);
++
++    // scrollingDeltaX > 0 means scroll left (negative horizontal), as in SDL (x = -deltaX)
++    a = scroll.add(10.0f, 0.0f, false);
++    CHECK(a.vertical == 0 && a.horizontal == -120);
++
++    // The reverse-scroll preference flips both axes
++    Trackpad::PreciseScroll reversed;
++    a = reversed.add(10.0f, 10.0f, true);
++    CHECK(a.vertical == -120 && a.horizontal == 120);
++}
++
++static void testWheelNotches()
++{
++    // One mouse wheel notch = 60 points = 720 units, sign kept, accelerated notches unclamped
++    Trackpad::ScrollAmounts a = Trackpad::wheelNotchAmounts(0.0f, 1.0f, false);
++    CHECK(a.vertical == 720 && a.horizontal == 0);
++    a = Trackpad::wheelNotchAmounts(0.0f, -3.0f, false);
++    CHECK(a.vertical == -2160);
++    a = Trackpad::wheelNotchAmounts(1.0f, 0.0f, false);
++    CHECK(a.vertical == 0 && a.horizontal == 720);
++    a = Trackpad::wheelNotchAmounts(1.0f, 1.0f, true);
++    CHECK(a.vertical == -720 && a.horizontal == -720);
++
++    // 50 accelerated notches overflow int16 and are split
++    a = Trackpad::wheelNotchAmounts(0.0f, 50.0f, false);
++    CHECK(a.vertical == 36000);
++    CHECK(chunksOf(a.vertical) == std::vector<short>({32767, 3233}));
++}
++
++static void testChunking()
++{
++    CHECK(chunksOf(0).empty());
++    CHECK(chunksOf(1) == std::vector<short>({1}));
++    CHECK(chunksOf(32767) == std::vector<short>({32767}));
++    CHECK(chunksOf(32768) == std::vector<short>({32767, 1}));
++    CHECK(chunksOf(-32768) == std::vector<short>({-32767, -1}));
++
++    std::vector<short> big = chunksOf(100000);
++    CHECK(big.size() == 4);
++    CHECK(sumOf(big) == 100000);
++
++    std::vector<short> bigNegative = chunksOf(-100000);
++    CHECK(sumOf(bigNegative) == -100000);
++    for (short chunk : bigNegative) {
++        CHECK(chunk < 0 && chunk != -32768);
++    }
++
++    std::vector<short> huge = chunksOf(5000000000LL);
++    CHECK(sumOf(huge) == 5000000000LL);
++}
++
++static void testPinch()
++{
++    Trackpad::PinchAccumulator pinch;
++    CHECK(pinch.add(0.05f) == 0);
++    CHECK(pinch.add(0.05f) == 1);   // 0.10 -> one step, 0.02 left
++    CHECK(pinch.add(-0.2f) == -2);  // -0.18 -> two steps out, -0.02 left
++    pinch.reset();
++    CHECK(pinch.add(0.07f) == 0);
++    pinch.reset();
++    CHECK(pinch.add(0.5f) == 6);    // 0.48 used, 0.02 left
++    CHECK(pinch.add(0.06f) == 1);
++    CHECK(pinch.add(0.0f) == 0);
++}
++
++static void testSwipe()
++{
++    CHECK(Trackpad::swipeActionForDeltaX(1.0f) == Trackpad::SwipeAction::Back);
++    CHECK(Trackpad::swipeActionForDeltaX(-1.0f) == Trackpad::SwipeAction::Forward);
++    CHECK(Trackpad::swipeActionForDeltaX(0.0f) == Trackpad::SwipeAction::None);
++    CHECK(Trackpad::swipeActionForDeltaX(0.2f) == Trackpad::SwipeAction::None);
++
++    // Back = Cmd+[, Forward = Cmd+]
++    CHECK(Trackpad::swipeShortcutKey(Trackpad::SwipeAction::Back) == 0xDB);
++    CHECK(Trackpad::swipeShortcutKey(Trackpad::SwipeAction::Forward) == 0xDD);
++    CHECK(Trackpad::swipeShortcutKey(Trackpad::SwipeAction::None) == 0);
++
++    struct Key { short vk; bool down; bool meta; bool extended; };
++    auto record = [](short vk, bool cmdHeld) {
++        std::vector<Key> keys;
++        Trackpad::sendCmdShortcut(vk, cmdHeld, [&keys](short key, bool down, bool meta, bool extended) {
++            keys.push_back({key, down, meta, extended});
++        });
++        return keys;
++    };
++
++    // Cmd not held: Cmd down, key down/up with Meta, Cmd up
++    std::vector<Key> keys = record(0xDB, false);
++    CHECK(keys.size() == 4);
++    if (keys.size() == 4) {
++        CHECK(keys[0].vk == 0x5B && keys[0].down && keys[0].meta && keys[0].extended);
++        CHECK(keys[1].vk == 0xDB && keys[1].down && keys[1].meta && !keys[1].extended);
++        CHECK(keys[2].vk == 0xDB && !keys[2].down && keys[2].meta);
++        CHECK(keys[3].vk == 0x5B && !keys[3].down && !keys[3].meta && keys[3].extended);
++    }
++
++    // Cmd already held by the user: only the key, so their Cmd stays down
++    keys = record(0xDD, true);
++    CHECK(keys.size() == 2);
++    if (keys.size() == 2) {
++        CHECK(keys[0].vk == 0xDD && keys[0].down && keys[0].meta);
++        CHECK(keys[1].vk == 0xDD && !keys[1].down && keys[1].meta);
++    }
++}
++
++static uint64_t hashText(const char* text)
++{
++    return ClipboardSyncState::contentHash("text/plain;charset=utf-8", text, std::strlen(text));
++}
++
++static void testClipboardState()
++{
++    CHECK(hashText("a") == hashText("a"));
++    CHECK(hashText("a") != hashText("b"));
++    CHECK(ClipboardSyncState::contentHash("text/plain;charset=utf-8", "a", 1) !=
++          ClipboardSyncState::contentHash("image/png", "a", 1));
++    CHECK(hashText("") != 0);
++
++    ClipboardSyncState state;
++
++    // Nothing synced yet: whatever is on the Mac gets sent
++    CHECK(state.shouldPush(5));
++    state.markPushStarted(5);
++    CHECK(!state.shouldPush(5));
++    CHECK(state.shouldPush(6));
++
++    // Our own push coming back from the host is not written to the Mac again
++    state.markPushSucceeded(hashText("mac copy"));
++    CHECK(!state.acceptHostContent(state.nextPullTicket(), 10, hashText("mac copy"), 5, 5));
++
++    // Same host sequence number: nothing new on the PC
++    CHECK(!state.acceptHostContent(state.nextPullTicket(), 10, hashText("other"), 5, 5));
++
++    // A new PC copy is applied, and the resulting pasteboard change isn't pushed back
++    CHECK(state.acceptHostContent(state.nextPullTicket(), 11, hashText("pc copy"), 5, 5));
++    state.markApplied(7, hashText("pc copy"));
++    CHECK(!state.shouldPush(7));
++
++    // An older pull finishing after a newer one is ignored
++    uint64_t older = state.nextPullTicket();
++    uint64_t newer = state.nextPullTicket();
++    CHECK(state.acceptHostContent(newer, 12, hashText("newest"), 7, 7));
++    CHECK(!state.acceptHostContent(older, 13, hashText("stale"), 7, 7));
++
++    // The Mac copied something while the pull was in flight: the Mac copy wins, and the
++    // host content is still considered on a later pull
++    CHECK(!state.acceptHostContent(state.nextPullTicket(), 14, hashText("pc later"), 7, 8));
++    CHECK(state.acceptHostContent(state.nextPullTicket(), 14, hashText("pc later"), 8, 8));
++
++    // A failed push is retried on the next focus change, unless the Mac copied again
++    state.markPushStarted(9);
++    state.markPushFailed(9);
++    CHECK(state.shouldPush(9));
++    state.markPushStarted(10);
++    state.markPushFailed(9);
++    CHECK(!state.shouldPush(10));
++}
++
++int main()
++{
++    testScrollUnits();
++    testScrollSigns();
++    testChunking();
++    testWheelNotches();
++    testPinch();
++    testSwipe();
++    testClipboardState();
++
++    if (s_Failures == 0) {
++        std::printf("lightpath input tests: all passed\n");
++        return 0;
++    }
++    std::printf("lightpath input tests: %d failure(s)\n", s_Failures);
++    return 1;
++}
+-- 
+2.56.0
+

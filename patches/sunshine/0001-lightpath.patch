@@ -1,27 +1,53 @@
-From 5437c97bf244e670b1fe4b673f7da4c1938e71c6 Mon Sep 17 00:00:00 2001
+From 97006f6a7d28ccb99631d294eea186d4138b70c2 Mon Sep 17 00:00:00 2001
 From: Shreyansh Kaushik <smkaushi@ucsc.edu>
 Date: Tue, 17 Nov 2026 00:23:24 -0800
 Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
- split-frame, route-MTU packet sizing, PipeWire fixes
+ split-frame, Mac client input, clipboard sharing
 
+- capture = mutter: per-stream virtual monitor matching the client mode, zero-copy capture
+- NVENC split-frame encoding on Linux, bitrate-aware preset
+- route-MTU packet sizing; advertise the LAN address to clients paired over a VPN overlay
+- PipeWire fixes (uninitialized state, renegotiation treated as a dead stream)
+- Mac clients (lightpathClient=mac): macOS shortcut translation (src/mac_keymap.h) and
+  pixel-precise touchpad scrolling through Mutter's remote desktop API
+- clipboard sharing for paired clients: GET/POST /lightpath/clipboard (text, PNG)
+
+Claude-Session: https://claude.ai/code/session_01JSGYnegbZ8CEyDK2p2YTH2
 ---
- cmake/compile_definitions/linux.cmake |  11 +-
- cmake/prep/options.cmake              |   2 +
- docs/configuration.md                 |   2 +-
- src/config.cpp                        |  10 +
- src/config.h                          |   3 +
- src/nvhttp.cpp                        |  69 +-
- src/platform/common.h                 |   9 +
- src/platform/linux/misc.cpp           |  34 +
- src/platform/linux/muttergrab.cpp     | 928 ++++++++++++++++++++++++++
- src/platform/linux/pipewire.cpp       |  77 ++-
- src/rtsp.cpp                          |  72 ++
- src/video.cpp                         |  33 +-
- 12 files changed, 1228 insertions(+), 22 deletions(-)
+ cmake/compile_definitions/linux.cmake         |  12 +-
+ cmake/prep/options.cmake                      |   2 +
+ docs/configuration.md                         | 108 +-
+ src/config.cpp                                |  14 +
+ src/config.h                                  |   6 +
+ src/input.cpp                                 |  79 ++
+ src/input.h                                   |  11 +
+ src/mac_keymap.h                              | 315 ++++++
+ src/nvhttp.cpp                                | 120 ++-
+ src/platform/common.h                         |   9 +
+ src/platform/linux/misc.cpp                   |  40 +-
+ src/platform/linux/mutter_rd.cpp              | 607 ++++++++++++
+ src/platform/linux/mutter_rd.h                | 101 ++
+ src/platform/linux/muttergrab.cpp             | 928 ++++++++++++++++++
+ src/platform/linux/pipewire.cpp               |  77 +-
+ src/rtsp.cpp                                  |  72 ++
+ src/rtsp.h                                    |   1 +
+ src/stream.cpp                                |   3 +
+ src/video.cpp                                 |  33 +-
+ .../assets/web/configs/config_tabs.json       |   4 +
+ .../common/assets/web/configs/tabs/Inputs.vue |  16 +
+ .../tabs/encoders/NvidiaNvencEncoder.vue      |  23 +-
+ .../assets/web/public/assets/locale/en.json   |   9 +
+ tests/unit/test_mac_keymap.cpp                | 497 ++++++++++
+ tests/unit/test_video.cpp                     |  20 +-
+ 25 files changed, 3080 insertions(+), 27 deletions(-)
+ create mode 100644 src/mac_keymap.h
+ create mode 100644 src/platform/linux/mutter_rd.cpp
+ create mode 100644 src/platform/linux/mutter_rd.h
  create mode 100644 src/platform/linux/muttergrab.cpp
+ create mode 100644 tests/unit/test_mac_keymap.cpp
 
 diff --git a/cmake/compile_definitions/linux.cmake b/cmake/compile_definitions/linux.cmake
-index b47c48a..894acfb 100644
+index b47c48a..86dcd16 100644
 --- a/cmake/compile_definitions/linux.cmake
 +++ b/cmake/compile_definitions/linux.cmake
 @@ -262,7 +262,7 @@ if(GIO_FOUND)
@@ -33,7 +59,7 @@ index b47c48a..894acfb 100644
      pkg_check_modules(PIPEWIRE libpipewire-0.3 REQUIRED)
  else()
      set(PIPEWIRE_FOUND OFF)
-@@ -283,6 +283,15 @@ if(PIPEWIRE_FOUND AND GIO_FOUND AND ${SUNSHINE_ENABLE_PORTAL})
+@@ -283,6 +283,16 @@ if(PIPEWIRE_FOUND AND GIO_FOUND AND ${SUNSHINE_ENABLE_PORTAL})
              "${CMAKE_SOURCE_DIR}/src/platform/linux/portalgrab.cpp")
  endif()
  
@@ -43,7 +69,8 @@ index b47c48a..894acfb 100644
 +    set(MUTTER_FOUND ON)
 +    add_compile_definitions(SUNSHINE_BUILD_MUTTER)
 +    list(APPEND PLATFORM_TARGET_FILES
-+            "${CMAKE_SOURCE_DIR}/src/platform/linux/muttergrab.cpp")
++            "${CMAKE_SOURCE_DIR}/src/platform/linux/muttergrab.cpp"
++            "${CMAKE_SOURCE_DIR}/src/platform/linux/mutter_rd.cpp")
 +endif()
 +
  # KWin ScreenCast (direct Wayland protocol, bypasses portal)
@@ -61,10 +88,130 @@ index f6d4e5b..58ac9db 100644
 +            "Enable GNOME Mutter virtual display grab (virtual monitor matching the client) if available" ON)
  endif()
 diff --git a/docs/configuration.md b/docs/configuration.md
-index 6024df7..403d93f 100644
+index 6024df7..828561a 100644
 --- a/docs/configuration.md
 +++ b/docs/configuration.md
-@@ -2624,7 +2624,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
+@@ -753,6 +753,63 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
+     </tr>
+ </table>
+ 
++### mac_shortcuts
++
++<table>
++    <tr>
++        <td>Description</td>
++        <td colspan="2">
++            Give Mac clients (Lightpath's Moonlight build identifies itself with `lightpathClient=mac`) macOS shortcut
++            semantics: Cmd+key acts as Ctrl+key (copy, paste, undo, find, new tab, ...), Cmd+click as Ctrl+click,
++            Cmd+Tab and Cmd+` switch windows, Cmd+Left/Right/Up/Down jump to line and document edges,
++            Cmd+Backspace deletes to the line start, Cmd+Space opens search, Cmd+H/M hide the window,
++            Cmd+[ and Cmd+] go back and forward, Option+arrows/Backspace/Delete work on words, and Option is Alt.
++            Shift and Ctrl pass through unchanged. Other clients are never affected.
++            <br>
++            On GNOME, Mac clients also get touchpad-quality scrolling: trackpad deltas are injected as finger scrolling
++            in logical pixels (1:1 with the fingers, kinetic scrolling where applications implement it).
++        </td>
++    </tr>
++    <tr>
++        <td>Default</td>
++        <td colspan="2">@code{}
++            enabled
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Example</td>
++        <td colspan="2">@code{}
++            mac_shortcuts = disabled
++            @endcode</td>
++    </tr>
++</table>
++
++### clipboard_sharing
++
++<table>
++    <tr>
++        <td>Description</td>
++        <td colspan="2">
++            Let paired clients exchange the clipboard with the host while streaming
++            (`GET`/`POST /lightpath/clipboard` on the client-certificate HTTPS port; text and PNG images up to 16 MiB).
++            A `GET` only returns what was copied on the host during the current stream.
++            Currently implemented for GNOME (Mutter's remote desktop clipboard API).
++        </td>
++    </tr>
++    <tr>
++        <td>Default</td>
++        <td colspan="2">@code{}
++            enabled
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Example</td>
++        <td colspan="2">@code{}
++            clipboard_sharing = disabled
++            @endcode</td>
++    </tr>
++</table>
++
+ ### keybindings
+ 
+ <table>
+@@ -2486,6 +2543,55 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
+     </tr>
+ </table>
+ 
++### nvenc_preset_low_bitrate
++
++<table>
++    <tr>
++        <td>Description</td>
++        <td colspan="2">
++            NVENC preset (1-7) for streams whose bitrate is at most
++            [nvenc_low_bitrate_kbps](#nvenc_low_bitrate_kbps), typically streams over the Internet: network
++            latency dwarfs the extra encoding time and a slower preset packs more picture into every bit.
++            `0` uses [nvenc_preset](#nvenc_preset) for every stream.
++        </td>
++    </tr>
++    <tr>
++        <td>Default</td>
++        <td colspan="2">@code{}
++            0
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Example</td>
++        <td colspan="2">@code{}
++            nvenc_preset_low_bitrate = 4
++            @endcode</td>
++    </tr>
++</table>
++
++### nvenc_low_bitrate_kbps
++
++<table>
++    <tr>
++        <td>Description</td>
++        <td colspan="2">
++            Bitrate threshold in Kbps for [nvenc_preset_low_bitrate](#nvenc_preset_low_bitrate).
++        </td>
++    </tr>
++    <tr>
++        <td>Default</td>
++        <td colspan="2">@code{}
++            50000
++            @endcode</td>
++    </tr>
++    <tr>
++        <td>Example</td>
++        <td colspan="2">@code{}
++            nvenc_low_bitrate_kbps = 60000
++            @endcode</td>
++    </tr>
++</table>
++
+ ### nvenc_twopass
+ 
+ <table>
+@@ -2624,7 +2730,7 @@ consent prompt for directory ACLs, so the Web UI shows setup steps for correctin
              Significantly reduces encoding latency with a marginal compression efficiency penalty.
              This option is ignored if your GPU has a singular NVENC unit.
              @note{This option only applies when using NVENC [encoder](#encoder) with HEVC or AV1.}
@@ -74,10 +221,19 @@ index 6024df7..403d93f 100644
      </tr>
      <tr>
 diff --git a/src/config.cpp b/src/config.cpp
-index 77d2d46..9acf403 100644
+index 77d2d46..4cf4c2b 100644
 --- a/src/config.cpp
 +++ b/src/config.cpp
-@@ -1693,6 +1693,16 @@ namespace config {
+@@ -863,6 +863,8 @@ namespace config {
+     true,  // always send scancodes
+     true,  // high resolution scrolling
+     true,  // native pen/touch support
++    true,  // mac_shortcuts
++    true,  // clipboard_sharing
+   };
+ 
+   /**
+@@ -1693,6 +1695,16 @@ namespace config {
      video.nv_legacy.h264_coder = video.nv.h264_cavlc ? NV_ENC_H264_ENTROPY_CODING_MODE_CAVLC : NV_ENC_H264_ENTROPY_CODING_MODE_CABAC;
      video.nv_legacy.spatial_aq = video.nv.adaptive_quantization;
      video.nv_legacy.vbv_percentage_increase = video.nv.vbv_percentage_increase;
@@ -94,8 +250,17 @@ index 77d2d46..9acf403 100644
  #endif
  
      int_f(vars, "qsv_preset", video.qsv.qsv_preset, qsv::preset_from_view);
+@@ -1922,6 +1934,8 @@ namespace config {
+ 
+     bool_f(vars, "high_resolution_scrolling", input.high_resolution_scrolling);
+     bool_f(vars, "native_pen_touch", input.native_pen_touch);
++    bool_f(vars, "mac_shortcuts", input.mac_shortcuts);
++    bool_f(vars, "clipboard_sharing", input.clipboard_sharing);
+ 
+     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
+     bool_f(vars, "system_tray", sunshine.system_tray);
 diff --git a/src/config.h b/src/config.h
-index dc890e2..81f016e 100644
+index dc890e2..14ba19f 100644
 --- a/src/config.h
 +++ b/src/config.h
 @@ -98,6 +98,9 @@ namespace config {
@@ -108,8 +273,517 @@ index dc890e2..81f016e 100644
      } nv_legacy;  ///< Legacy NVIDIA encoder options kept for config compatibility.
  
      struct {
+@@ -321,6 +324,9 @@ namespace config {
+ 
+     bool high_resolution_scrolling;  ///< Enable high-resolution mouse-wheel events.
+     bool native_pen_touch;  ///< Enable native pen and touch injection.
++
++    bool mac_shortcuts;  ///< Translate macOS shortcuts (Cmd+C, Option+Left, Cmd+Tab, ...) for clients that identify as Macs.
++    bool clipboard_sharing;  ///< Let paired clients read and replace the host clipboard.
+   };
+ 
+   namespace flag {
+diff --git a/src/input.cpp b/src/input.cpp
+index a6afa54..eb4cbe8 100644
+--- a/src/input.cpp
++++ b/src/input.cpp
+@@ -33,7 +33,11 @@ extern "C" {
+ #include "globals.h"
+ #include "input.h"
+ #include "logging.h"
++#include "mac_keymap.h"
+ #include "platform/common.h"
++#ifdef __linux__
++  #include "platform/linux/mutter_rd.h"
++#endif
+ #include "platform/virtualhid_input.h"
+ #include "thread_pool.h"
+ #include "utility.h"
+@@ -68,6 +72,7 @@ namespace input {
+   constexpr auto VKEY_MENU = 0x12;  ///< Windows virtual-key code for menu.
+   constexpr auto VKEY_LMENU = 0xA4;  ///< Windows virtual-key code for lmenu.
+   constexpr auto VKEY_RMENU = 0xA5;  ///< Windows virtual-key code for rmenu.
++  constexpr double MAC_SCROLL_UNITS_PER_POINT = 12.0;  ///< Lightpath Mac clients: 10 points = 120 = one wheel notch.
+ 
+   constexpr auto SS_KEY_UNDO = 0x0100;  ///< Non-normalized client keycode for undo.
+   constexpr auto SS_KEY_CUT = 0x0101;  ///< Non-normalized client keycode for cut.
+@@ -337,8 +342,14 @@ namespace input {
+ 
+     int32_t accumulated_vscroll_delta {};  ///< Accumulated vscroll delta.
+     int32_t accumulated_hscroll_delta {};  ///< Accumulated hscroll delta.
++
++    bool mac_client {};  ///< Client is a Mac (Lightpath Moonlight): macOS shortcuts and pixel scrolling.
++    mac_keymap::translator_t mac_keys;  ///< macOS shortcut translator state.
+   };
+ 
++  void emit_mac_events(const mac_keymap::events_t &events);
++  bool mac_shortcuts(const input_t &input);
++
+   /**
+    * @brief Hash string-like session identifiers without allocating temporary strings.
+    */
+@@ -936,6 +947,12 @@ namespace input {
+ 
+     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
+     auto button = util::endian::big(packet->button);
++    if (!release && mac_shortcuts(*input)) {
++      // Cmd+click must arrive as Ctrl+click even right after Cmd+Left lifted Ctrl.
++      mac_keymap::events_t events;
++      input->mac_keys.pointer_button(events);
++      emit_mac_events(events);
++    }
+     if (button > 0 && button < mouse_press.size()) {
+       if (mouse_press[button] != release) {
+         // button state is already what we want
+@@ -1196,6 +1213,24 @@ namespace input {
+     key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, key_code, flags, synthetic_modifiers).task_id;
+   }
+ 
++  /**
++   * @brief Emit host key events produced by the macOS shortcut translator.
++   *
++   * @param events Host key events, in order.
++   */
++  void emit_mac_events(const mac_keymap::events_t &events) {
++    for (const auto &e : events) {
++      emit_keyboard_update(map_keycode(e.vk), e.release, 0, mac_keymap::is_extended(e.vk));
++    }
++  }
++
++  /**
++   * @return Whether this stream's keyboard gets macOS shortcut semantics.
++   */
++  bool mac_shortcuts(const input_t &input) {
++    return input.mac_client && config::input.mac_shortcuts;
++  }
++
+   /**
+    * @brief Forward a client input packet directly to the platform backend.
+    *
+@@ -1241,6 +1276,17 @@ namespace input {
+       }
+     }
+ 
++    if (mac_shortcuts(*input)) {
++      mac_keymap::events_t events;
++      if (input->mac_keys.key(keyCode, release, input->shift_keys.any_pressed(), events)) {
++        emit_mac_events(events);
++        return;
++      }
++      // Cmd and Option belong to the translator; keys reaching the normal path are typed
++      // without them, so never synthesize Alt from the packet's modifier flags.
++      modifiers &= ~MODIFIER_ALT;
++    }
++
+     update_modifier_state(*input, keyCode, release);
+ 
+     // Right-alt maps to meta, so it must not also register as ALT
+@@ -1310,6 +1356,16 @@ namespace input {
+       return;
+     }
+ 
++#ifdef __linux__
++    // Mac clients send scroll distances in points (MAC_SCROLL_UNITS_PER_POINT units each).
++    // Injected as finger scrolling they move content 1:1 with the trackpad. With Ctrl held
++    // (pinch-to-zoom arrives as Ctrl + wheel) the wheel path below keeps zoom steps discrete.
++    if (input->mac_client && !input->control_keys.any_pressed() &&
++        mutter_rd::scroll(0.0, -util::endian::big(packet->scrollAmt1) / MAC_SCROLL_UNITS_PER_POINT)) {
++      return;
++    }
++#endif
++
+     if (config::input.high_resolution_scrolling) {
+       platf::scroll(platf_input, util::endian::big(packet->scrollAmt1));
+     } else {
+@@ -1333,6 +1389,13 @@ namespace input {
+       return;
+     }
+ 
++#ifdef __linux__
++    if (input->mac_client && !input->control_keys.any_pressed() &&
++        mutter_rd::scroll(util::endian::big(packet->scrollAmount) / MAC_SCROLL_UNITS_PER_POINT, 0.0)) {
++      return;
++    }
++#endif
++
+     if (config::input.high_resolution_scrolling) {
+       platf::hscroll(platf_input, util::endian::big(packet->scrollAmount));
+     } else {
+@@ -2371,6 +2434,9 @@ namespace input {
+    * @param input Retained stream input state to reset.
+    */
+   void reset_input_state(const std::shared_ptr<input_t> &input) {
++    mac_keymap::events_t events;
++    input->mac_keys.reset(events);
++    emit_mac_events(events);
+     reset_mouse_buttons();
+     reset_keyboard_keys();
+     reset_gamepads(input);
+@@ -2512,6 +2578,19 @@ namespace input {
+     return input;
+   }
+ 
++  void set_mac_client(std::shared_ptr<input_t> &input, bool mac) {
++    dispatch_input_task([input, mac]() {
++      // A resumed stream may carry translator state from the previous connection.
++      mac_keymap::events_t events;
++      input->mac_keys.reset(events);
++      emit_mac_events(events);
++      input->mac_client = mac;
++    });
++    if (mac) {
++      BOOST_LOG(info) << "Mac client: macOS shortcuts "sv << (config::input.mac_shortcuts ? "on"sv : "off"sv) << ", pixel-precise trackpad scrolling"sv;
++    }
++  }
++
+ #ifdef SUNSHINE_TESTS
+   namespace testing {
+     void set_platform_input(platf::input_t input) {
+diff --git a/src/input.h b/src/input.h
+index 41e0439..d63eb64 100644
+--- a/src/input.h
++++ b/src/input.h
+@@ -84,6 +84,17 @@ namespace input {
+    */
+   std::shared_ptr<input_t> alloc(safe::mail_t mail, std::string session_id);
+ 
++  /**
++   * @brief Mark the stream's client as a Mac.
++   *
++   * Mac clients get macOS shortcut semantics (Cmd acts as Ctrl, Option+arrows move by word,
++   * Cmd+Tab switches windows, ...) and touchpad-quality scrolling where the platform supports it.
++   *
++   * @param input The input context pointer.
++   * @param mac True for a Mac client.
++   */
++  void set_mac_client(std::shared_ptr<input_t> &input, bool mac);
++
+ #ifdef SUNSHINE_TESTS
+   namespace testing {
+     /**
+diff --git a/src/mac_keymap.h b/src/mac_keymap.h
+new file mode 100644
+index 0000000..1eb2729
+--- /dev/null
++++ b/src/mac_keymap.h
+@@ -0,0 +1,315 @@
++/**
++ * @file src/mac_keymap.h
++ * @brief macOS keyboard semantics for Mac clients streaming a Linux/Windows desktop.
++ *
++ * Mac users press Cmd where PC users press Ctrl, move by word with Option+arrows, jump to the
++ * line start with Cmd+Left, switch windows with Cmd+Tab and search with Cmd+Space. This
++ * translator turns the client's physical keys into the host shortcuts that do the same thing:
++ *
++ * | Mac                      | Host                          |
++ * |--------------------------|-------------------------------|
++ * | Cmd + key                | Ctrl + key                    |
++ * | Cmd + click              | Ctrl + click                  |
++ * | Cmd + Tab / Cmd + `      | Alt + Tab / Alt + ` (held)    |
++ * | Cmd + Left / Right       | Home / End                    |
++ * | Cmd + Up / Down          | Ctrl + Home / Ctrl + End      |
++ * | Cmd + Backspace          | delete to line start          |
++ * | Cmd + Space              | Super (search)                |
++ * | Cmd + H / Cmd + M        | Super + H (hide window)       |
++ * | Cmd + [ / Cmd + ]        | Alt + Left / Alt + Right      |
++ * | Option + arrows          | Ctrl + arrows (word/paragraph)|
++ * | Option + Backspace / Del | Ctrl + Backspace / Delete     |
++ * | Option + other key       | Alt + key                     |
++ *
++ * Shift and Ctrl pass through untouched, so Cmd+Shift+Z is Ctrl+Shift+Z and Shift+Option+Left
++ * selects a word. Host modifiers are always pressed before stale ones are released, so no
++ * application ever sees a lone Alt tap (which would toggle menu bars).
++ *
++ * The translator is pure: it emits host key events into a vector and owns no I/O, which keeps
++ * it trivially testable.
++ */
++#pragma once
++
++// standard includes
++#include <cstdint>
++#include <unordered_map>
++#include <vector>
++
++namespace mac_keymap {
++  /**
++   * @brief Windows virtual-key codes used by the GameStream protocol.
++   */
++  namespace vk {
++    constexpr std::uint16_t BACK = 0x08;
++    constexpr std::uint16_t TAB = 0x09;
++    constexpr std::uint16_t SPACE = 0x20;
++    constexpr std::uint16_t END = 0x23;
++    constexpr std::uint16_t HOME = 0x24;
++    constexpr std::uint16_t LEFT = 0x25;
++    constexpr std::uint16_t UP = 0x26;
++    constexpr std::uint16_t RIGHT = 0x27;
++    constexpr std::uint16_t DOWN = 0x28;
++    constexpr std::uint16_t DEL = 0x2E;
++    constexpr std::uint16_t KEY_H = 0x48;
++    constexpr std::uint16_t KEY_M = 0x4D;
++    constexpr std::uint16_t LWIN = 0x5B;
++    constexpr std::uint16_t RWIN = 0x5C;
++    constexpr std::uint16_t LSHIFT = 0xA0;
++    constexpr std::uint16_t RCONTROL = 0xA3;
++    constexpr std::uint16_t MENU = 0x12;
++    constexpr std::uint16_t LMENU = 0xA4;
++    constexpr std::uint16_t RMENU = 0xA5;
++    constexpr std::uint16_t OEM_3 = 0xC0;  ///< ` ~
++    constexpr std::uint16_t OEM_4 = 0xDB;  ///< [ {
++    constexpr std::uint16_t OEM_6 = 0xDD;  ///< ] }
++  }  // namespace vk
++
++  /**
++   * @brief One key event for the host.
++   */
++  struct host_event_t {
++    std::uint16_t vk;  ///< Virtual-key code.
++    bool release;  ///< Key up.
++
++    bool operator==(const host_event_t &) const = default;
++  };
++
++  using events_t = std::vector<host_event_t>;
++
++  /**
++   * @return True for navigation keys that need the "extended" flag on Windows hosts.
++   */
++  constexpr bool is_extended(std::uint16_t code) {
++    switch (code) {
++      case vk::END:
++      case vk::HOME:
++      case vk::LEFT:
++      case vk::UP:
++      case vk::RIGHT:
++      case vk::DOWN:
++      case vk::DEL:
++      case vk::LWIN:
++      case vk::RWIN:
++      case vk::RCONTROL:
++      case vk::RMENU:
++        return true;
++      default:
++        return false;
++    }
++  }
++
++  /**
++   * @brief Stateful Mac → host shortcut translator for one client.
++   */
++  class translator_t {
++  public:
++    /**
++     * @brief Feed one client key event.
++     *
++     * @param code Client virtual-key code (normalized, without the 0x8000 flag).
++     * @param release Key up.
++     * @param shift_held Whether the client currently holds Shift (already pressed on the host).
++     * @param out Host events to emit, in order.
++     * @return True when the translator handled the key; false means "pass it through as is".
++     */
++    bool key(std::uint16_t code, bool release, bool shift_held, events_t &out) {
++      if (const auto bit = cmd_bit(code)) {
++        update(cmd, bit, release);
++        set_mods(base(), out);
++        return true;
++      }
++      if (const auto bit = opt_bit(code)) {
++        update(opt, bit, release);
++        set_mods(base(), out);
++        return true;
++      }
++
++      if (release) {
++        const auto it = held.find(code);
++        if (it == held.end()) {
++          return false;
++        }
++        out.push_back({it->second, true});
++        held.erase(it);
++        return true;
++      }
++
++      if (!cmd && !opt) {
++        // Plain typing. Host modifiers are already clear here (both releases call set_mods).
++        return false;
++      }
++
++      if (const auto it = held.find(code); it != held.end()) {
++        // A press without a release in between (lost packet): release the old mapping first.
++        out.push_back({it->second, true});
++        held.erase(it);
++      }
++
++      if (cmd) {
++        switch (code) {
++          case vk::TAB:
++          case vk::OEM_3:
++            // Alt stays down until Cmd is released, so the window switcher stays open.
++            return map(code, code, {false, true, false}, out);
++          case vk::LEFT:
++            return map(code, vk::HOME, {}, out);
++          case vk::RIGHT:
++            return map(code, vk::END, {}, out);
++          case vk::UP:
++            return map(code, vk::HOME, {true, false, false}, out);
++          case vk::DOWN:
++            return map(code, vk::END, {true, false, false}, out);
++          case vk::OEM_4:
++            return map(code, vk::LEFT, {false, true, false}, out);
++          case vk::OEM_6:
++            return map(code, vk::RIGHT, {false, true, false}, out);
++          case vk::KEY_H:
++          case vk::KEY_M:
++            return map(code, vk::KEY_H, {false, false, true}, out);
++          case vk::SPACE:
++            set_mods({}, out);
++            tap(vk::LWIN, out);
++            return true;
++          case vk::BACK:
++            // Select to the line start, then delete the selection (or the line break when the
++            // cursor already is at the start, like on a Mac).
++            set_mods({}, out);
++            release_target(vk::BACK, out);
++            if (!shift_held) {
++              out.push_back({vk::LSHIFT, false});
++            }
++            tap(vk::HOME, out);
++            if (!shift_held) {
++              out.push_back({vk::LSHIFT, true});
++            }
++            tap(vk::BACK, out);
++            return true;
++          default:
++            return map(code, code, {true, opt != 0, false}, out);
++        }
++      }
++
++      // Option without Cmd
++      switch (code) {
++        case vk::LEFT:
++        case vk::RIGHT:
++        case vk::UP:
++        case vk::DOWN:
++        case vk::BACK:
++        case vk::DEL:
++          return map(code, code, {true, false, false}, out);
++        default:
++          return map(code, code, {false, true, false}, out);
++      }
++    }
++
++    /**
++     * @brief A mouse button is about to be pressed: Cmd+click must arrive as Ctrl+click.
++     */
++    void pointer_button(events_t &out) {
++      if (cmd || opt) {
++        set_mods(base(), out);
++      }
++    }
++
++    /**
++     * @brief Release everything the translator holds on the host (stream ends or resets).
++     */
++    void reset(events_t &out) {
++      for (const auto &[client, host] : held) {
++        out.push_back({host, true});
++      }
++      held.clear();
++      cmd = opt = 0;
++      set_mods({}, out);
++    }
++
++    /**
++     * @return Whether Cmd is held on the client.
++     */
++    bool cmd_held() const {
++      return cmd != 0;
++    }
++
++  private:
++    struct mods_t {
++      bool ctrl = false;
++      bool alt = false;
++      bool super = false;
++    };
++
++    static std::uint8_t cmd_bit(std::uint16_t code) {
++      return code == vk::LWIN ? 1 : code == vk::RWIN ? 2 : 0;
++    }
++
++    static std::uint8_t opt_bit(std::uint16_t code) {
++      return code == vk::LMENU || code == vk::MENU ? 1 : code == vk::RMENU ? 2 : 0;
++    }
++
++    static void update(std::uint8_t &mask, std::uint8_t bit, bool release) {
++      mask = release ? (mask & ~bit) : (mask | bit);
++    }
++
++    mods_t base() const {
++      return {cmd != 0, opt != 0, false};
++    }
++
++    /**
++     * @brief Move the host's translator-owned modifiers to @p want, new ones first.
++     */
++    void set_mods(mods_t want, events_t &out) {
++      if (want.ctrl && !host.ctrl) {
++        out.push_back({vk::RCONTROL, false});
++      }
++      if (want.alt && !host.alt) {
++        out.push_back({vk::LMENU, false});
++      }
++      if (want.super && !host.super) {
++        out.push_back({vk::LWIN, false});
++      }
++      if (!want.ctrl && host.ctrl) {
++        out.push_back({vk::RCONTROL, true});
++      }
++      if (!want.alt && host.alt) {
++        out.push_back({vk::LMENU, true});
++      }
++      if (!want.super && host.super) {
++        out.push_back({vk::LWIN, true});
++      }
++      host = want;
++    }
++
++    /**
++     * @brief Two client keys can map to the same host key (Cmd+Left and Cmd+Up both press
++     * Home, Cmd+Backspace taps Home): keep every host key pressed at most once.
++     */
++    void release_target(std::uint16_t target, events_t &out) {
++      for (auto it = held.begin(); it != held.end(); ++it) {
++        if (it->second == target) {
++          out.push_back({target, true});
++          held.erase(it);
++          return;
++        }
++      }
++    }
++
++    bool map(std::uint16_t client, std::uint16_t target, mods_t mods, events_t &out) {
++      release_target(target, out);
++      set_mods(mods, out);
++      out.push_back({target, false});
++      held[client] = target;
++      return true;
++    }
++
++    void tap(std::uint16_t code, events_t &out) {
++      release_target(code, out);
++      out.push_back({code, false});
++      out.push_back({code, true});
++    }
++
++    std::uint8_t cmd = 0;  ///< Client Cmd keys held (bit 0 left, bit 1 right).
++    std::uint8_t opt = 0;  ///< Client Option keys held.
++    mods_t host;  ///< Modifiers the translator currently holds on the host.
++    std::unordered_map<std::uint16_t, std::uint16_t> held;  ///< Client key → host key it pressed.
++  };
++}  // namespace mac_keymap
 diff --git a/src/nvhttp.cpp b/src/nvhttp.cpp
-index 7601cb8..3f2580c 100644
+index 7601cb8..b0d3ef5 100644
 --- a/src/nvhttp.cpp
 +++ b/src/nvhttp.cpp
 @@ -12,6 +12,7 @@
@@ -120,7 +794,15 @@ index 7601cb8..3f2580c 100644
  #include <string>
  #include <utility>
  
-@@ -44,6 +45,68 @@
+@@ -31,6 +32,7 @@
+ #include "httpcommon.h"
+ #include "logging.h"
+ #include "network.h"
++#include "platform/linux/mutter_rd.h"
+ #include "nvhttp.h"
+ #include "platform/common.h"
+ #include "process.h"
+@@ -44,6 +46,68 @@
  using namespace std::literals;
  
  namespace nvhttp {
@@ -189,7 +871,15 @@ index 7601cb8..3f2580c 100644
  
    static constexpr std::string_view EMPTY_PROPERTY_TREE_ERROR_MSG = "Property tree is empty. Probably, control flow got interrupted by an unexpected C++ exception. This is a bug in Sunshine. Moonlight-qt will report Malformed XML (missing root element)."sv;
  
-@@ -1274,7 +1337,7 @@ namespace nvhttp {
+@@ -521,6 +585,7 @@ namespace nvhttp {
+     launch_session->continuous_audio = util::from_view(get_arg(args, "continuousAudio", "0"));
+     launch_session->gcmap = (int) util::from_view(get_arg(args, "gcmap", "0"));
+     launch_session->enable_hdr = util::from_view(get_arg(args, "hdrMode", "0"));
++    launch_session->mac_client = get_arg(args, "lightpathClient", "") == "mac";
+ 
+     // Encrypted RTSP is enabled with client reported corever >= 1
+     auto corever = util::from_view(get_arg(args, "corever", "0"));
+@@ -1274,7 +1339,7 @@ namespace nvhttp {
      // Only include the MAC address for requests sent from paired clients over HTTPS.
      // For HTTP requests, use a placeholder MAC address that Moonlight knows to ignore.
      if constexpr (std::is_same_v<SunshineHTTPS, T>) {
@@ -198,7 +888,7 @@ index 7601cb8..3f2580c 100644
      } else {
        tree.put("root.mac", "00:00:00:00:00:00");
      }
-@@ -1288,10 +1351,10 @@ namespace nvhttp {
+@@ -1288,10 +1353,10 @@ namespace nvhttp {
      // have that implemented. For now, we will emulate the behavior of GFE+GS-IPv6-Forwarder,
      // which returns 127.0.0.1 as LocalIP for IPv6 connections. Moonlight clients with IPv6
      // support know to ignore this bogus address.
@@ -211,6 +901,69 @@ index 7601cb8..3f2580c 100644
      }
  
      const uint32_t codec_mode_flags = get_codec_mode_flags();
+@@ -1628,6 +1693,51 @@ namespace nvhttp {
+     response->close_connection_after_response = true;
+   }
+ 
++  /**
++   * @brief Lightpath clipboard sharing for paired clients.
++   *
++   * GET returns what was copied on the host during the current stream (204 when nothing new),
++   * with the content type and an `X-Lightpath-Clipboard-Seq` counter. POST replaces the host
++   * clipboard with the body (`text/plain;charset=utf-8` or `image/png`). Only reachable over
++   * the client-certificate HTTPS server, i.e. by paired clients.
++   *
++   * @param response HTTPS response.
++   * @param request HTTPS request.
++   */
++  void clipboard(resp_https_t response, req_https_t request) {
++    SimpleWeb::CaseInsensitiveMultimap headers;
++    headers.emplace("Cache-Control", "no-store");
++    if (!config::input.clipboard_sharing) {
++      response->write(SimpleWeb::StatusCode::client_error_not_found, headers);
++      return;
++    }
++
++    if (request->method == "POST") {
++      std::string mime = "text/plain;charset=utf-8";
++      if (const auto it = request->header.find("Content-Type"); it != request->header.end()) {
++        mime = it->second;
++      }
++      std::ostringstream body;
++      body << request->content.rdbuf();
++      auto data = std::move(body).str();
++      const auto size = data.size();
++      const bool ok = mutter_rd::clipboard_set(mime, std::move(data));
++      BOOST_LOG(debug) << "Clipboard from client: "sv << size << " bytes ("sv << mime << ")"sv << (ok ? ""sv : " rejected"sv);
++      response->write(ok ? SimpleWeb::StatusCode::success_ok : SimpleWeb::StatusCode::server_error_service_unavailable, headers);
++      return;
++    }
++
++    auto clip = mutter_rd::clipboard_get();
++    if (!clip) {
++      response->write(SimpleWeb::StatusCode::success_no_content, headers);
++      return;
++    }
++    BOOST_LOG(debug) << "Clipboard to client: "sv << clip->data.size() << " bytes ("sv << clip->mime << ')';
++    headers.emplace("Content-Type", clip->mime);
++    headers.emplace("X-Lightpath-Clipboard-Seq", std::to_string(clip->seq));
++    response->write(SimpleWeb::StatusCode::success_ok, clip->data, headers);
++  }
++
+   void setup(const std::string &pkey, const std::string &cert) {
+     conf_intern.pkey = pkey;
+     conf_intern.servercert = cert;
+@@ -1743,6 +1853,10 @@ namespace nvhttp {
+       resume(host_audio, resp, req);
+     };
+     https_server.resource["^/cancel$"]["GET"] = cancel;
++    https_server.resource["^/lightpath/clipboard$"]["GET"] = clipboard;
++    https_server.resource["^/lightpath/clipboard$"]["POST"] = clipboard;
++    // Bounds every request body, in particular clipboard uploads (larger ones get 413).
++    https_server.config.max_request_streambuf_size = mutter_rd::MAX_CLIPBOARD_BYTES + (1u << 20);
+ 
+     https_server.config.reuse_address = true;
+     https_server.config.address = net::get_bind_address(address_family);
 diff --git a/src/platform/common.h b/src/platform/common.h
 index b261688..943e633 100644
 --- a/src/platform/common.h
@@ -239,10 +992,36 @@ index b261688..943e633 100644
    constexpr auto MAX_GAMEPADS = 16;  ///< Maximum number of simultaneously tracked gamepads.
  
 diff --git a/src/platform/linux/misc.cpp b/src/platform/linux/misc.cpp
-index 9e2d2a7..58c4905 100644
+index 9e2d2a7..d8f00ac 100644
 --- a/src/platform/linux/misc.cpp
 +++ b/src/platform/linux/misc.cpp
-@@ -1171,6 +1171,9 @@ namespace platf {
+@@ -59,6 +59,7 @@
+ // local includes
+ #include "graphics.h"
+ #include "misc.h"
++#include "mutter_rd.h"
+ #include "src/compat/boost_process.h"
+ #include "src/config.h"
+ #include "src/entry_handler.h"
+@@ -616,14 +617,15 @@ namespace platf {
+    * @brief Apply Linux platform state before streaming starts.
+    */
+   void streaming_will_start() {
+-    // Nothing to do
++    // GNOME: clipboard sharing and touchpad-quality scrolling for the stream
++    mutter_rd::start();
+   }
+ 
+   /**
+    * @brief Restore Linux platform state after streaming stops.
+    */
+   void streaming_will_stop() {
+-    // Nothing to do
++    mutter_rd::stop();
+   }
+ 
+   /**
+@@ -1171,6 +1173,9 @@ namespace platf {
  #endif
  #ifdef SUNSHINE_BUILD_PORTAL
        PORTAL,  ///< XDG PORTAL
@@ -252,7 +1031,7 @@ index 9e2d2a7..58c4905 100644
  #endif
        MAX_FLAGS  ///< The maximum number of flags
      };
-@@ -1311,6 +1314,20 @@ namespace platf {
+@@ -1311,6 +1316,20 @@ namespace platf {
    }
  #endif
  
@@ -273,7 +1052,7 @@ index 9e2d2a7..58c4905 100644
  #ifdef SUNSHINE_BUILD_KWIN
    std::vector<std::string> kwin_display_names();
    std::shared_ptr<display_t> kwin_display(mem_type_e hwdevice_type, const std::string &display_name, const video::config_t &config);
-@@ -1354,6 +1371,11 @@ namespace platf {
+@@ -1354,6 +1373,11 @@ namespace platf {
      if (sources[source::KWIN]) {
        return kwin_display_names();
      }
@@ -285,7 +1064,7 @@ index 9e2d2a7..58c4905 100644
  #endif
      return {};
    }
-@@ -1423,6 +1445,12 @@ namespace platf {
+@@ -1423,6 +1447,12 @@ namespace platf {
        return kwin_display(hwdevice_type, display_name, config);
      }
  #endif
@@ -298,7 +1077,7 @@ index 9e2d2a7..58c4905 100644
  
      return nullptr;
    }
-@@ -1506,6 +1534,12 @@ namespace platf {
+@@ -1506,6 +1536,12 @@ namespace platf {
        sources[source::KWIN] = true;
      }
  #endif
@@ -311,6 +1090,726 @@ index 9e2d2a7..58c4905 100644
  #ifdef SUNSHINE_BUILD_PORTAL
      if (portal_available || (config::video.capture.empty() && sources.none() && verify_portal())) {
        sources[source::PORTAL] = true;
+diff --git a/src/platform/linux/mutter_rd.cpp b/src/platform/linux/mutter_rd.cpp
+new file mode 100644
+index 0000000..62260c9
+--- /dev/null
++++ b/src/platform/linux/mutter_rd.cpp
+@@ -0,0 +1,607 @@
++/**
++ * @file src/platform/linux/mutter_rd.cpp
++ * @brief GNOME (Mutter) remote desktop session: clipboard sharing and touchpad-style scrolling.
++ *
++ * One org.gnome.Mutter.RemoteDesktop session is kept while streams run (and for a short while
++ * after the last one ends, so a client can still fetch the clipboard while disconnecting). All
++ * D-Bus signal handling happens on a dedicated GLib main loop thread; scroll events and
++ * clipboard requests are issued from the calling threads, which GDBus allows.
++ *
++ * Clipboard model: the PC clipboard is read on demand (SelectionRead). Content the client sends
++ * is offered with SetSelection and served from memory on SelectionTransfer; Mutter's own
++ * clipboard manager keeps a copy, so it survives the end of the session.
++ */
++// standard includes
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <functional>
++#include <future>
++#include <memory>
++#include <mutex>
++#include <string_view>
++#include <thread>
++#include <vector>
++
++// platform includes
++#include <fcntl.h>
++#include <gio/gio.h>
++#include <gio/gunixfdlist.h>
++#include <poll.h>
++#include <unistd.h>
++
++// local includes
++#include "mutter_rd.h"
++#include "src/logging.h"
++
++using namespace std::literals;
++
++namespace mutter_rd {
++  namespace {
++    constexpr const char *RD_BUS = "org.gnome.Mutter.RemoteDesktop";
++    constexpr const char *RD_PATH = "/org/gnome/Mutter/RemoteDesktop";
++    constexpr const char *RD_IFACE = "org.gnome.Mutter.RemoteDesktop";
++    constexpr const char *SESSION_IFACE = "org.gnome.Mutter.RemoteDesktop.Session";
++    constexpr guint32 AXIS_FINISH = 1u << 0;  ///< META_REMOTE_DESKTOP_NOTIFY_AXIS_FLAGS_FINISH
++    constexpr guint32 AXIS_SOURCE_FINGER = 1u << 2;  ///< META_REMOTE_DESKTOP_NOTIFY_AXIS_FLAGS_SOURCE_FINGER
++    constexpr int CALL_TIMEOUT_MS = 3000;
++    constexpr gint64 SCROLL_FINISH_AFTER_US = 80'000;  ///< Fingers are considered lifted after this pause.
++    constexpr guint SCROLL_FINISH_POLL_MS = 20;
++    constexpr guint LINGER_S = 15;  ///< Keep the session after the last stream ends.
++    constexpr auto READ_TIMEOUT = 1500ms;
++    constexpr const char *TEXT_MIME = "text/plain;charset=utf-8";
++    constexpr const char *PNG_MIME = "image/png";
++    /// Every name X11 and Wayland applications ask for when pasting text.
++    constexpr const char *TEXT_OFFERS[] = {"text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT"};
++    /// Best text format first when reading from the PC.
++    constexpr const char *TEXT_READ_ORDER[] = {"text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"};
++
++    bool is_text_mime(std::string_view mime) {
++      return mime.starts_with("text/plain") || mime == "UTF8_STRING" || mime == "STRING" || mime == "TEXT";
++    }
++
++    bool set_blocking(int fd, bool blocking) {
++      const int flags = fcntl(fd, F_GETFL);
++      if (flags < 0) {
++        return false;
++      }
++      return fcntl(fd, F_SETFL, blocking ? (flags & ~O_NONBLOCK) : (flags | O_NONBLOCK)) == 0;
++    }
++
++    /**
++     * @brief Write everything to a blocking descriptor.
++     */
++    bool write_all(int fd, const std::string &data) {
++      std::size_t off = 0;
++      while (off < data.size()) {
++        const ssize_t n = write(fd, data.data() + off, data.size() - off);
++        if (n < 0) {
++          if (errno == EINTR) {
++            continue;
++          }
++          return false;
++        }
++        off += static_cast<std::size_t>(n);
++      }
++      return true;
++    }
++
++    /**
++     * @brief Read a non-blocking descriptor until EOF, a deadline or the size limit.
++     */
++    std::optional<std::string> read_all(int fd, std::chrono::milliseconds timeout) {
++      std::string out;
++      char buf[64 * 1024];
++      const auto deadline = std::chrono::steady_clock::now() + timeout;
++      for (;;) {
++        const ssize_t n = read(fd, buf, sizeof(buf));
++        if (n > 0) {
++          if (out.size() + static_cast<std::size_t>(n) > MAX_CLIPBOARD_BYTES) {
++            return std::nullopt;
++          }
++          out.append(buf, static_cast<std::size_t>(n));
++          continue;
++        }
++        if (n == 0) {
++          return out;
++        }
++        if (errno == EINTR) {
++          continue;
++        }
++        if (errno != EAGAIN && errno != EWOULDBLOCK) {
++          return std::nullopt;
++        }
++        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
++        if (left <= 0ms) {
++          return std::nullopt;
++        }
++        pollfd pfd {fd, POLLIN, 0};
++        poll(&pfd, 1, static_cast<int>(left.count()));
++      }
++    }
++
++    /**
++     * @brief The process-wide remote desktop session.
++     */
++    class service_t {
++    public:
++      static service_t &instance() {
++        static service_t service;
++        return service;
++      }
++
++      void start() {
++        if (!ensure_thread()) {
++          return;
++        }
++        invoke([this]() {
++          ++users;
++          if (linger_source) {
++            g_source_destroy(linger_source);
++            g_source_unref(linger_source);
++            linger_source = nullptr;
++          }
++          if (session_path().empty()) {
++            create_session();
++            // The initial SelectionOwnerChanged is dispatched before this low-priority idle runs:
++            // what is already on the PC clipboard is not news for the new stream.
++            GSource *idle = g_idle_source_new();
++            g_source_set_priority(idle, G_PRIORITY_LOW);
++            g_source_set_callback(idle, [](gpointer self) -> gboolean {
++              static_cast<service_t *>(self)->reset_baseline();
++              return G_SOURCE_REMOVE;
++            },
++                                  this,
++                                  nullptr);
++            g_source_attach(idle, ctx);
++            g_source_unref(idle);
++          } else {
++            reset_baseline();
++          }
++        });
++      }
++
++      void stop() {
++        if (!ensure_thread()) {
++          return;
++        }
++        invoke([this]() {
++          if (users == 0 || --users > 0 || linger_source) {
++            return;
++          }
++          linger_source = g_timeout_source_new_seconds(LINGER_S);
++          g_source_set_callback(linger_source, [](gpointer self) -> gboolean {
++            auto *s = static_cast<service_t *>(self);
++            g_source_unref(s->linger_source);
++            s->linger_source = nullptr;
++            s->destroy_session();
++            return G_SOURCE_REMOVE;
++          },
++                                this,
++                                nullptr);
++          g_source_attach(linger_source, ctx);
++        });
++      }
++
++      bool scroll(double dx, double dy) {
++        const auto path = session_path();
++        if (path.empty()) {
++          return false;
++        }
++        g_dbus_connection_call(conn, RD_BUS, path.c_str(), SESSION_IFACE, "NotifyPointerAxis", g_variant_new("(ddu)", dx, dy, AXIS_SOURCE_FINGER), nullptr, G_DBUS_CALL_FLAGS_NONE, -1, nullptr, nullptr, nullptr);
++        last_scroll_us = g_get_monotonic_time();
++        if (!finish_pending.exchange(true)) {
++          invoke([this]() {
++            GSource *timer = g_timeout_source_new(SCROLL_FINISH_POLL_MS);
++            g_source_set_callback(timer, [](gpointer self) -> gboolean {
++              return static_cast<service_t *>(self)->maybe_finish_scroll();
++            },
++                                  this,
++                                  nullptr);
++            g_source_attach(timer, ctx);
++            g_source_unref(timer);
++          });
++        }
++        return true;
++      }
++
++      std::optional<clipboard_t> clipboard_get() {
++        std::vector<std::string> mimes;
++        std::string path;
++        std::uint64_t seq_now;
++        {
++          std::lock_guard lg {lock};
++          if (session.empty() || session_owns || seq == baseline_seq) {
++            // Nothing was copied on the PC during this stream.
++            return std::nullopt;
++          }
++          mimes = pc_mimes;
++          path = session;
++          seq_now = seq;
++        }
++
++        auto has = [&mimes](std::string_view m) {
++          return std::ranges::find(mimes, m) != mimes.end();
++        };
++        for (const char *mime : TEXT_READ_ORDER) {
++          if (has(mime)) {
++            auto data = read_selection(path, mime);
++            if (!data) {
++              return std::nullopt;
++            }
++            return clipboard_t {TEXT_MIME, std::move(*data), seq_now};
++          }
++        }
++        if (has(PNG_MIME)) {
++          auto data = read_selection(path, PNG_MIME);
++          if (!data) {
++            return std::nullopt;
++          }
++          return clipboard_t {PNG_MIME, std::move(*data), seq_now};
++        }
++        return std::nullopt;
++      }
++
++      bool clipboard_set(const std::string &mime, std::string data) {
++        const bool text = is_text_mime(mime);
++        if ((!text && mime != PNG_MIME) || data.size() > MAX_CLIPBOARD_BYTES) {
++          return false;
++        }
++
++        std::string path;
++        {
++          std::lock_guard lg {lock};
++          if (session.empty()) {
++            return false;
++          }
++          path = session;
++          own_mime = text ? TEXT_MIME : PNG_MIME;
++          own_data = std::make_shared<const std::string>(std::move(data));
++          session_owns = true;
++        }
++
++        GVariantBuilder offers;
++        g_variant_builder_init(&offers, G_VARIANT_TYPE("as"));
++        if (text) {
++          for (const char *m : TEXT_OFFERS) {
++            g_variant_builder_add(&offers, "s", m);
++          }
++        } else {
++          g_variant_builder_add(&offers, "s", PNG_MIME);
++        }
++        GVariantBuilder options;
++        g_variant_builder_init(&options, G_VARIANT_TYPE("a{sv}"));
++        g_variant_builder_add(&options, "{sv}", "mime-types", g_variant_builder_end(&offers));
++
++        g_autoptr(GError) err = nullptr;
++        g_autoptr(GVariant) r = g_dbus_connection_call_sync(conn, RD_BUS, path.c_str(), SESSION_IFACE, "SetSelection", g_variant_new("(a{sv})", &options), nullptr, G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS, nullptr, &err);
++        if (!r) {
++          BOOST_LOG(warning) << "[mutter_rd] SetSelection failed: "sv << (err ? err->message : "unknown");
++          std::lock_guard lg {lock};
++          session_owns = false;
++          own_data.reset();
++          return false;
++        }
++        return true;
++      }
++
++      bool available() {
++        return !session_path().empty();
++      }
++
++    private:
++      service_t() = default;
++
++      // ---- thread plumbing -------------------------------------------------------------------
++
++      bool ensure_thread() {
++        std::call_once(thread_once, [this]() {
++          ctx = g_main_context_new();
++          std::promise<bool> opened;
++          auto ready = opened.get_future();
++          std::thread([this, opened = std::move(opened)]() mutable {
++            g_main_context_push_thread_default(ctx);
++            opened.set_value(open_connection());
++            GMainLoop *loop = g_main_loop_new(ctx, FALSE);
++            g_main_loop_run(loop);  // runs for the lifetime of the process
++            g_main_loop_unref(loop);
++          }).detach();
++          connected = ready.get();
++        });
++        return connected;
++      }
++
++      bool open_connection() {
++        g_autoptr(GError) err = nullptr;
++        g_autofree gchar *address = g_dbus_address_get_for_bus_sync(G_BUS_TYPE_SESSION, nullptr, &err);
++        if (!address) {
++          BOOST_LOG(info) << "[mutter_rd] No session bus, clipboard sharing and touchpad scrolling disabled"sv;
++          return false;
++        }
++        conn = g_dbus_connection_new_for_address_sync(address, GDBusConnectionFlags(G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT | G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION), nullptr, nullptr, &err);
++        if (!conn) {
++          BOOST_LOG(warning) << "[mutter_rd] Session bus connection failed: "sv << (err ? err->message : "unknown");
++          return false;
++        }
++        g_dbus_connection_set_exit_on_close(conn, FALSE);
++        return true;
++      }
++
++      /**
++       * @brief Run @p fn on the main loop thread.
++       *
++       * Always queued (never g_main_context_invoke, which runs the function on the calling
++       * thread when the loop has not acquired its context yet): signal subscriptions made in
++       * there must belong to the loop thread or their callbacks are never dispatched.
++       */
++      void invoke(std::function<void()> fn) {
++        GSource *source = g_idle_source_new();
++        g_source_set_priority(source, G_PRIORITY_DEFAULT);
++        g_source_set_callback(source, [](gpointer data) -> gboolean {
++          (*static_cast<std::function<void()> *>(data))();
++          return G_SOURCE_REMOVE;
++        },
++                              new std::function<void()>(std::move(fn)),
++                              [](gpointer data) {
++                                delete static_cast<std::function<void()> *>(data);
++                              });
++        g_source_attach(source, ctx);
++        g_source_unref(source);
++      }
++
++      std::string session_path() {
++        std::lock_guard lg {lock};
++        return session;
++      }
++
++      GVariant *call(const std::string &path, const char *method, GVariant *params, const GVariantType *reply_type = nullptr) {
++        g_autoptr(GError) err = nullptr;
++        GVariant *r = g_dbus_connection_call_sync(conn, RD_BUS, path.c_str(), path == RD_PATH ? RD_IFACE : SESSION_IFACE, method, params, reply_type, G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS, nullptr, &err);
++        if (!r) {
++          BOOST_LOG(warning) << "[mutter_rd] "sv << method << " failed: "sv << (err ? err->message : "unknown");
++        }
++        return r;
++      }
++
++      // ---- session lifecycle (main loop thread) -------------------------------------------
++
++      void create_session() {
++        g_autoptr(GVariant) created = call(RD_PATH, "CreateSession", nullptr, G_VARIANT_TYPE("(o)"));
++        if (!created) {
++          BOOST_LOG(info) << "[mutter_rd] GNOME remote desktop API unavailable; clipboard sharing and touchpad scrolling disabled"sv;
++          return;
++        }
++        const gchar *p = nullptr;
++        g_variant_get(created, "(&o)", &p);
++        std::string path = p;
++
++        subscription = g_dbus_connection_signal_subscribe(conn, nullptr, SESSION_IFACE, nullptr, path.c_str(), nullptr, G_DBUS_SIGNAL_FLAGS_NONE, [](GDBusConnection *, const gchar *, const gchar *, const gchar *, const gchar *signal, GVariant *params, gpointer self) {
++          static_cast<service_t *>(self)->on_signal(signal, params);
++        },
++                                                          this,
++                                                          nullptr);
++
++        g_autoptr(GVariant) started = call(path, "Start", nullptr);
++        if (!started) {
++          g_dbus_connection_signal_unsubscribe(conn, subscription);
++          subscription = 0;
++          return;
++        }
++        {
++          std::lock_guard lg {lock};
++          session = path;
++          pc_mimes.clear();
++          session_owns = false;
++          own_data.reset();
++        }
++        GVariantBuilder none;
++        g_variant_builder_init(&none, G_VARIANT_TYPE("a{sv}"));
++        g_autoptr(GVariant) clip = call(path, "EnableClipboard", g_variant_new("(a{sv})", &none));
++        BOOST_LOG(info) << "[mutter_rd] Remote desktop session ready (clipboard "sv << (clip ? "shared"sv : "unavailable"sv) << ", touchpad scrolling)"sv;
++      }
++
++      void destroy_session() {
++        const auto path = session_path();
++        if (!path.empty()) {
++          g_autoptr(GVariant) r = call(path, "Stop", nullptr);
++        }
++        forget_session();
++      }
++
++      void forget_session() {
++        if (subscription) {
++          g_dbus_connection_signal_unsubscribe(conn, subscription);
++          subscription = 0;
++        }
++        std::lock_guard lg {lock};
++        if (!session.empty()) {
++          BOOST_LOG(info) << "[mutter_rd] Remote desktop session closed"sv;
++        }
++        session.clear();
++        pc_mimes.clear();
++        session_owns = false;
++        own_data.reset();
++      }
++
++      void reset_baseline() {
++        std::lock_guard lg {lock};
++        baseline_seq = seq;
++      }
++
++      // ---- signals (main loop thread) ------------------------------------------------------
++
++      void on_signal(const gchar *signal, GVariant *params) {
++        const std::string_view name {signal};
++        if (name == "SelectionOwnerChanged") {
++          g_autoptr(GVariant) options = g_variant_get_child_value(params, 0);
++          gboolean is_owner = FALSE;
++          g_variant_lookup(options, "session-is-owner", "b", &is_owner);
++          std::vector<std::string> mimes;
++          // Mutter sends "mime-types" as "(as)" although its interface documentation says "as".
++          g_autoptr(GVariant) value = g_variant_lookup_value(options, "mime-types", nullptr);
++          g_autoptr(GVariant) list = nullptr;
++          if (value && g_variant_is_of_type(value, G_VARIANT_TYPE("(as)"))) {
++            list = g_variant_get_child_value(value, 0);
++          } else if (value && g_variant_is_of_type(value, G_VARIANT_TYPE("as"))) {
++            list = g_variant_ref(value);
++          }
++          if (list) {
++            gsize n = 0;
++            const gchar **strv = g_variant_get_strv(list, &n);
++            mimes.assign(strv, strv + n);
++            g_free(strv);
++          }
++          BOOST_LOG(debug) << "[mutter_rd] Clipboard owner changed ("sv << (is_owner ? "us"sv : "host application"sv) << ", "sv << mimes.size() << " formats)"sv;
++          std::lock_guard lg {lock};
++          if (is_owner) {
++            session_owns = true;
++          } else {
++            pc_mimes = std::move(mimes);
++            session_owns = false;
++            own_data.reset();
++            ++seq;
++          }
++        } else if (name == "SelectionTransfer") {
++          const gchar *mime = nullptr;
++          guint32 serial = 0;
++          g_variant_get(params, "(&su)", &mime, &serial);
++          serve_transfer(mime, serial);
++        } else if (name == "Closed") {
++          forget_session();
++        }
++      }
++
++      void serve_transfer(std::string_view mime, guint32 serial) {
++        std::shared_ptr<const std::string> data;
++        std::string path;
++        {
++          std::lock_guard lg {lock};
++          const bool match = own_data && (own_mime == PNG_MIME ? mime == PNG_MIME : is_text_mime(mime));
++          if (match) {
++            data = own_data;
++          }
++          path = session;
++        }
++        if (path.empty()) {
++          return;
++        }
++        if (!data) {
++          g_dbus_connection_call(conn, RD_BUS, path.c_str(), SESSION_IFACE, "SelectionWriteDone", g_variant_new("(ub)", serial, FALSE), nullptr, G_DBUS_CALL_FLAGS_NONE, -1, nullptr, nullptr, nullptr);
++          return;
++        }
++
++        g_autoptr(GError) err = nullptr;
++        g_autoptr(GUnixFDList) fds = nullptr;
++        g_autoptr(GVariant) r = g_dbus_connection_call_with_unix_fd_list_sync(conn, RD_BUS, path.c_str(), SESSION_IFACE, "SelectionWrite", g_variant_new("(u)", serial), G_VARIANT_TYPE("(h)"), G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS, nullptr, &fds, nullptr, &err);
++        int fd = -1;
++        if (r && fds) {
++          gint32 handle = -1;
++          g_variant_get(r, "(h)", &handle);
++          fd = g_unix_fd_list_get(fds, handle, &err);
++        }
++        if (fd < 0) {
++          BOOST_LOG(warning) << "[mutter_rd] SelectionWrite failed: "sv << (err ? err->message : "no descriptor");
++          return;
++        }
++        // The reader may be slow (or a large image): never block the signal loop on it.
++        std::thread([conn = conn, path, serial, fd, data]() {
++          set_blocking(fd, true);
++          const bool ok = write_all(fd, *data);
++          close(fd);
++          g_dbus_connection_call(conn, RD_BUS, path.c_str(), SESSION_IFACE, "SelectionWriteDone", g_variant_new("(ub)", serial, ok), nullptr, G_DBUS_CALL_FLAGS_NONE, -1, nullptr, nullptr, nullptr);
++        }).detach();
++      }
++
++      gboolean maybe_finish_scroll() {
++        if (g_get_monotonic_time() - last_scroll_us < SCROLL_FINISH_AFTER_US) {
++          return G_SOURCE_CONTINUE;
++        }
++        const auto path = session_path();
++        if (!path.empty()) {
++          g_dbus_connection_call(conn, RD_BUS, path.c_str(), SESSION_IFACE, "NotifyPointerAxis", g_variant_new("(ddu)", 0.0, 0.0, AXIS_SOURCE_FINGER | AXIS_FINISH), nullptr, G_DBUS_CALL_FLAGS_NONE, -1, nullptr, nullptr, nullptr);
++        }
++        finish_pending = false;
++        // A delta may have slipped in between the check and the reset: keep watching then.
++        if (g_get_monotonic_time() - last_scroll_us < SCROLL_FINISH_AFTER_US && !finish_pending.exchange(true)) {
++          return G_SOURCE_CONTINUE;
++        }
++        return G_SOURCE_REMOVE;
++      }
++
++      std::optional<std::string> read_selection(const std::string &path, const char *mime) {
++        std::lock_guard rl {read_lock};  // Mutter refuses parallel reads
++        g_autoptr(GError) err = nullptr;
++        g_autoptr(GUnixFDList) fds = nullptr;
++        g_autoptr(GVariant) r = g_dbus_connection_call_with_unix_fd_list_sync(conn, RD_BUS, path.c_str(), SESSION_IFACE, "SelectionRead", g_variant_new("(s)", mime), G_VARIANT_TYPE("(h)"), G_DBUS_CALL_FLAGS_NONE, CALL_TIMEOUT_MS, nullptr, &fds, nullptr, &err);
++        int fd = -1;
++        if (r && fds) {
++          gint32 handle = -1;
++          g_variant_get(r, "(h)", &handle);
++          fd = g_unix_fd_list_get(fds, handle, &err);
++        }
++        if (fd < 0) {
++          BOOST_LOG(warning) << "[mutter_rd] SelectionRead failed: "sv << (err ? err->message : "no descriptor");
++          return std::nullopt;
++        }
++        set_blocking(fd, false);
++        auto data = read_all(fd, READ_TIMEOUT);
++        close(fd);
++        if (!data) {
++          BOOST_LOG(warning) << "[mutter_rd] Clipboard read timed out or exceeded "sv << (MAX_CLIPBOARD_BYTES >> 20) << " MiB"sv;
++        }
++        return data;
++      }
++
++      // ---- state ---------------------------------------------------------------------------
++
++      std::once_flag thread_once;
++      bool connected = false;
++      GMainContext *ctx = nullptr;
++      GDBusConnection *conn = nullptr;  ///< Private connection, constant once opened.
++
++      // Main loop thread only.
++      int users = 0;
++      GSource *linger_source = nullptr;
++      guint subscription = 0;
++
++      // Any thread.
++      std::atomic<gint64> last_scroll_us {0};
++      std::atomic_bool finish_pending {false};
++      std::mutex read_lock;
++
++      std::mutex lock;  ///< Guards everything below.
++      std::string session;
++      std::vector<std::string> pc_mimes;
++      bool session_owns = false;
++      std::string own_mime;
++      std::shared_ptr<const std::string> own_data;
++      std::uint64_t seq = 1;
++      std::uint64_t baseline_seq = 1;
++    };
++  }  // namespace
++
++  void start() {
++    service_t::instance().start();
++  }
++
++  void stop() {
++    service_t::instance().stop();
++  }
++
++  bool scroll(double dx, double dy) {
++    return service_t::instance().scroll(dx, dy);
++  }
++
++  std::optional<clipboard_t> clipboard_get() {
++    return service_t::instance().clipboard_get();
++  }
++
++  bool clipboard_set(const std::string &mime, std::string data) {
++    return service_t::instance().clipboard_set(mime, std::move(data));
++  }
++
++  bool available() {
++    return service_t::instance().available();
++  }
++}  // namespace mutter_rd
+diff --git a/src/platform/linux/mutter_rd.h b/src/platform/linux/mutter_rd.h
+new file mode 100644
+index 0000000..e51e66b
+--- /dev/null
++++ b/src/platform/linux/mutter_rd.h
+@@ -0,0 +1,101 @@
++/**
++ * @file src/platform/linux/mutter_rd.h
++ * @brief GNOME (Mutter) remote desktop session: clipboard sharing and touchpad-style scrolling.
++ *
++ * While a stream runs, Sunshine holds one org.gnome.Mutter.RemoteDesktop session. It gives
++ * clients two things uinput cannot:
++ *
++ *  - Clipboard sharing. The PC clipboard can be read and replaced over Mutter's own clipboard
++ *    API (what gnome-remote-desktop uses), so the client can sync copy/paste both ways.
++ *  - Touchpad-quality scrolling. Scroll deltas from a precise client trackpad are injected as
++ *    finger scrolling in logical pixels, so applications scroll 1:1 with the fingers instead of
++ *    animating a mouse wheel notch per event.
++ *
++ * Everything degrades to a no-op when Mutter's API is not available.
++ */
++#pragma once
++
++// standard includes
++#include <cstdint>
++#include <optional>
++#include <string>
++
++namespace mutter_rd {
++  /**
++   * @brief One clipboard snapshot.
++   */
++  struct clipboard_t {
++    std::string mime;  ///< "text/plain;charset=utf-8" or "image/png".
++    std::string data;  ///< Raw bytes.
++    std::uint64_t seq {};  ///< Increases whenever the PC clipboard changes on the PC side.
++  };
++
++  constexpr std::size_t MAX_CLIPBOARD_BYTES = 16u << 20;  ///< Larger clipboards are not synced.
++
++#ifdef SUNSHINE_BUILD_MUTTER
++  /**
++   * @brief A stream starts: make sure the remote desktop session exists.
++   */
++  void start();
++
++  /**
++   * @brief A stream ended: the session is closed a few seconds after the last stream ends.
++   */
++  void stop();
++
++  /**
++   * @brief Scroll by a precise amount, like two fingers on a touchpad.
++   *
++   * A scroll gesture is finished automatically once deltas stop arriving, which lets
++   * applications start their own kinetic scrolling where they implement it.
++   *
++   * @param dx Horizontal delta in logical pixels, positive scrolls right.
++   * @param dy Vertical delta in logical pixels, positive scrolls down.
++   * @return False when no remote desktop session is available (caller falls back).
++   */
++  bool scroll(double dx, double dy);
++
++  /**
++   * @brief Read the PC clipboard (text preferred, then PNG).
++   *
++   * @return Snapshot, or empty when the clipboard is empty, too large or unavailable.
++   */
++  std::optional<clipboard_t> clipboard_get();
++
++  /**
++   * @brief Replace the PC clipboard.
++   *
++   * @param mime "text/plain;charset=utf-8" (any text/plain) or "image/png".
++   * @param data Content.
++   * @return True when the PC clipboard now offers the content.
++   */
++  bool clipboard_set(const std::string &mime, std::string data);
++
++  /**
++   * @return Whether a remote desktop session is currently running.
++   */
++  bool available();
++#else
++  inline void start() {
++  }
++
++  inline void stop() {
++  }
++
++  inline bool scroll(double, double) {
++    return false;
++  }
++
++  inline std::optional<clipboard_t> clipboard_get() {
++    return std::nullopt;
++  }
++
++  inline bool clipboard_set(const std::string &, std::string) {
++    return false;
++  }
++
++  inline bool available() {
++    return false;
++  }
++#endif
++}  // namespace mutter_rd
 diff --git a/src/platform/linux/muttergrab.cpp b/src/platform/linux/muttergrab.cpp
 new file mode 100644
 index 0000000..5c57f15
@@ -1487,6 +2986,46 @@ index cd2dd9e..36e3f71 100644
        config.monitor.height = (int) util::from_view(args.at("x-nv-video[0].clientViewportHt"sv));
        config.monitor.width = (int) util::from_view(args.at("x-nv-video[0].clientViewportWd"sv));
  
+diff --git a/src/rtsp.h b/src/rtsp.h
+index 108c881..198c634 100644
+--- a/src/rtsp.h
++++ b/src/rtsp.h
+@@ -94,6 +94,7 @@ namespace rtsp_stream {
+     bool enable_hdr;  ///< Whether HDR streaming is requested.
+     bool enable_sops;  ///< Whether sequence output protection is requested.
+     std::string client_name;  ///< Friendly client name from initial pairing.
++    bool mac_client = false;  ///< Client identified itself as a Mac (Lightpath Moonlight): Mac shortcut translation.
+ 
+     std::optional<crypto::cipher::gcm_t> rtsp_cipher;  ///< AES-GCM cipher used once encrypted RTSP is negotiated.
+     std::string rtsp_url_scheme;  ///< URL scheme selected by the RTSP SETUP flow.
+diff --git a/src/stream.cpp b/src/stream.cpp
+index a222b40..1148705 100644
+--- a/src/stream.cpp
++++ b/src/stream.cpp
+@@ -563,6 +563,7 @@ namespace stream {
+     std::uint32_t launch_session_id;  ///< RTSP launch-session ID associated with this stream.
+     std::string client_cert;  ///< PEM certificate for the paired client owning the stream.
+     std::string input_session_id;  ///< Stable client identity used to retain input devices across resume.
++    bool mac_client = false;  ///< Client is a Mac: translate its shortcuts and trackpad scrolling.
+ 
+     safe::mail_raw_t::event_t<bool> shutdown_event;  ///< Event raised when the stream should shut down.
+     safe::signal_t controlEnd;  ///< Signal raised when the control channel exits.
+@@ -2344,6 +2345,7 @@ namespace stream {
+      */
+     int start(session_t &session, const std::string &addr_string) {
+       session.input = input::alloc(session.mail, session.input_session_id);
++      input::set_mac_client(session.input, session.mac_client);
+ 
+       session.broadcast_ref = broadcast.ref();
+       if (!session.broadcast_ref) {
+@@ -2396,6 +2398,7 @@ namespace stream {
+       session->launch_session_id = launch_session.id;
+       session->client_cert = launch_session.client_cert;
+       session->input_session_id = launch_session.client_cert.empty() ? launch_session.unique_id : launch_session.client_cert;
++      session->mac_client = launch_session.mac_client;
+ 
+       session->config = config;
+ 
 diff --git a/src/video.cpp b/src/video.cpp
 index 995e8a7..6e9612d 100644
 --- a/src/video.cpp
@@ -1567,6 +3106,651 @@ index 995e8a7..6e9612d 100644
      BOOST_LOG(info) << "Trying encoder ["sv << encoder.name << ']';
      auto fg = util::fail_guard([&]() {
        BOOST_LOG(info) << "Encoder ["sv << encoder.name << "] failed"sv;
+diff --git a/src_assets/common/assets/web/configs/config_tabs.json b/src_assets/common/assets/web/configs/config_tabs.json
+index 5a61541..90dc247 100644
+--- a/src_assets/common/assets/web/configs/config_tabs.json
++++ b/src_assets/common/assets/web/configs/config_tabs.json
+@@ -31,6 +31,8 @@
+       "mouse": "enabled",
+       "high_resolution_scrolling": "enabled",
+       "native_pen_touch": "enabled",
++      "mac_shortcuts": "enabled",
++      "clipboard_sharing": "enabled",
+       "keybindings": "[0x10,0xA0,0x11,0xA2,0x12,0xA4]"
+     }
+   },
+@@ -113,6 +115,8 @@
+     "nameKey": "config.category_nvidia_nvenc_encoder",
+     "options": {
+       "nvenc_preset": 1,
++      "nvenc_preset_low_bitrate": 0,
++      "nvenc_low_bitrate_kbps": 50000,
+       "nvenc_twopass": "quarter_res",
+       "nvenc_spatial_aq": "disabled",
+       "nvenc_vbv_increase": 0,
+diff --git a/src_assets/common/assets/web/configs/tabs/Inputs.vue b/src_assets/common/assets/web/configs/tabs/Inputs.vue
+index 0bf6645..613c2a9 100644
+--- a/src_assets/common/assets/web/configs/tabs/Inputs.vue
++++ b/src_assets/common/assets/web/configs/tabs/Inputs.vue
+@@ -340,6 +340,22 @@ watch(
+               default="true"
+     ></Checkbox>
+ 
++    <!-- Mac shortcuts and trackpad -->
++    <Checkbox class="mb-3"
++              id="mac_shortcuts"
++              locale-prefix="config"
++              v-model="config.mac_shortcuts"
++              default="true"
++    ></Checkbox>
++
++    <!-- Clipboard sharing -->
++    <Checkbox class="mb-3"
++              id="clipboard_sharing"
++              locale-prefix="config"
++              v-model="config.clipboard_sharing"
++              default="true"
++    ></Checkbox>
++
+     <!-- Native pen/touch support -->
+     <Checkbox v-if="config.mouse === 'enabled'"
+               class="mb-3"
+diff --git a/src_assets/common/assets/web/configs/tabs/encoders/NvidiaNvencEncoder.vue b/src_assets/common/assets/web/configs/tabs/encoders/NvidiaNvencEncoder.vue
+index 7d20e02..4bd0901 100644
+--- a/src_assets/common/assets/web/configs/tabs/encoders/NvidiaNvencEncoder.vue
++++ b/src_assets/common/assets/web/configs/tabs/encoders/NvidiaNvencEncoder.vue
+@@ -27,8 +27,29 @@ const config = ref(props.config)
+       <div class="form-text">{{ $t('config.nvenc_preset_desc') }}</div>
+     </div>
+ 
++    <!-- Low-bitrate preset -->
++    <div class="mb-3">
++      <label for="nvenc_preset_low_bitrate" class="form-label">{{ $t('config.nvenc_preset_low_bitrate') }}</label>
++      <select id="nvenc_preset_low_bitrate" class="form-select" v-model="config.nvenc_preset_low_bitrate">
++        <option value="0">{{ $t('config.nvenc_preset_low_bitrate_same') }}</option>
++        <option value="1">P1</option>
++        <option value="2">P2</option>
++        <option value="3">P3</option>
++        <option value="4">P4</option>
++        <option value="5">P5</option>
++        <option value="6">P6</option>
++        <option value="7">P7</option>
++      </select>
++      <div class="form-text">{{ $t('config.nvenc_preset_low_bitrate_desc') }}</div>
++    </div>
++    <div class="mb-3" v-if="config.nvenc_preset_low_bitrate > 0">
++      <label for="nvenc_low_bitrate_kbps" class="form-label">{{ $t('config.nvenc_low_bitrate_kbps') }}</label>
++      <input type="number" min="0" max="1000000" class="form-control" id="nvenc_low_bitrate_kbps" v-model="config.nvenc_low_bitrate_kbps" />
++      <div class="form-text">{{ $t('config.nvenc_low_bitrate_kbps_desc') }}</div>
++    </div>
++
+     <!-- Split frame encoding -->
+-    <div class="mb-3" v-if="platform === 'windows'">
++    <div class="mb-3" v-if="platform === 'windows' || platform === 'linux'">
+       <label for="nvenc_split_encode" class="form-label">{{ $t('config.nvenc_split_encode') }}</label>
+       <select id="nvenc_split_encode" class="form-select" v-model="config.nvenc_split_encode">
+         <option value="disabled">{{ $t('_common.disabled') }}</option>
+diff --git a/src_assets/common/assets/web/public/assets/locale/en.json b/src_assets/common/assets/web/public/assets/locale/en.json
+index b914ed1..5a87280 100644
+--- a/src_assets/common/assets/web/public/assets/locale/en.json
++++ b/src_assets/common/assets/web/public/assets/locale/en.json
+@@ -342,6 +342,10 @@
+     "motion_as_ds4_desc": "If disabled, motion sensors will not be taken into account during gamepad type selection.",
+     "mouse": "Enable Mouse Input",
+     "mouse_desc": "Allows guests to control the host system with the mouse",
++    "mac_shortcuts": "Mac Shortcuts and Trackpad",
++    "mac_shortcuts_desc": "For Mac clients (Lightpath's Moonlight build), translate macOS shortcuts into the host's: Cmd+C/V/Z/... act as Ctrl, Cmd+Tab switches windows, Cmd+Space opens search, Cmd+arrows jump to line and document edges, Option+arrows move by word. On GNOME, Mac trackpad scrolling is injected as touchpad scrolling in exact pixels.",
++    "clipboard_sharing": "Clipboard Sharing",
++    "clipboard_sharing_desc": "Let paired clients copy and paste between their clipboard and the host's while streaming (text and images up to 16 MB; GNOME hosts).",
+     "native_pen_touch": "Native Pen/Touch Support",
+     "native_pen_touch_desc": "When enabled, Sunshine will pass through native pen/touch events from Moonlight clients. This can be useful to disable for older applications without native pen/touch support.",
+     "notify_pre_releases": "PreRelease Notifications",
+@@ -355,6 +359,11 @@
+     "nvenc_preset": "Performance preset",
+     "nvenc_preset_1": "(fastest, default)",
+     "nvenc_preset_7": "(slowest)",
++    "nvenc_preset_low_bitrate": "Preset for low-bitrate streams",
++    "nvenc_preset_low_bitrate_desc": "Streams at or below the bitrate below (typically over the Internet) use this preset instead: network latency dwarfs the extra encoding time, and a slower preset packs more picture into every bit.",
++    "nvenc_preset_low_bitrate_same": "Same as the performance preset",
++    "nvenc_low_bitrate_kbps": "Low-bitrate threshold (Kbps)",
++    "nvenc_low_bitrate_kbps_desc": "Streams with this bitrate or less use the low-bitrate preset.",
+     "nvenc_preset_desc": "Higher numbers improve compression (quality at given bitrate) at the cost of increased encoding latency. Recommended to change only when limited by network or decoder, otherwise similar effect can be accomplished by increasing bitrate.",
+     "nvenc_realtime_hags": "Use realtime priority in hardware accelerated gpu scheduling",
+     "nvenc_realtime_hags_desc": "Currently NVIDIA drivers may freeze in encoder when HAGS is enabled, realtime priority is used and VRAM utilization is close to maximum. Disabling this option lowers the priority to high, sidestepping the freeze at the cost of reduced capture performance when the GPU is heavily loaded.",
+diff --git a/tests/unit/test_mac_keymap.cpp b/tests/unit/test_mac_keymap.cpp
+new file mode 100644
+index 0000000..a929969
+--- /dev/null
++++ b/tests/unit/test_mac_keymap.cpp
+@@ -0,0 +1,497 @@
++/**
++ * @file tests/unit/test_mac_keymap.cpp
++ * @brief Tests for the macOS shortcut translator in src/mac_keymap.h.
++ *
++ * The translator is pure, so these tests feed client key sequences and check the exact host key
++ * stream: which shortcuts come out, that host modifiers are pressed before stale ones are
++ * released (no lone Alt taps that toggle menu bars), and, with a randomized stress test, that no
++ * host key is ever left pressed or released twice whatever order the client keys arrive in.
++ */
++#ifdef LIGHTPATH_STANDALONE_TEST
++  #include <gtest/gtest.h>
++#else
++  #include "../tests_common.h"
++#endif
++
++// standard includes
++#include <map>
++#include <random>
++#include <set>
++
++// local includes
++#include "src/mac_keymap.h"
++
++using namespace mac_keymap;
++
++namespace {
++  constexpr std::uint16_t KEY_A = 0x41;
++  constexpr std::uint16_t KEY_B = 0x42;
++  constexpr std::uint16_t KEY_C = 0x43;
++  constexpr std::uint16_t KEY_V = 0x56;
++  constexpr std::uint16_t KEY_Z = 0x5A;
++
++  host_event_t down(std::uint16_t code) {
++    return {code, false};
++  }
++
++  host_event_t up(std::uint16_t code) {
++    return {code, true};
++  }
++
++  /**
++   * @brief Drive a translator like Sunshine does and keep the full host stream.
++   */
++  struct harness_t {
++    translator_t t;
++    events_t host;
++    bool shift = false;
++
++    bool press(std::uint16_t code) {
++      return t.key(code, false, shift, host);
++    }
++
++    bool release(std::uint16_t code) {
++      return t.key(code, true, shift, host);
++    }
++
++    events_t take() {
++      events_t out;
++      out.swap(host);
++      return out;
++    }
++  };
++}  // namespace
++
++TEST(MacKeymapTest, CmdLettersBecomeCtrlShortcuts) {
++  harness_t h;
++  EXPECT_TRUE(h.press(vk::LWIN));
++  EXPECT_TRUE(h.press(KEY_C));
++  EXPECT_TRUE(h.release(KEY_C));
++  EXPECT_TRUE(h.press(KEY_V));
++  EXPECT_TRUE(h.release(KEY_V));
++  EXPECT_TRUE(h.release(vk::LWIN));
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(KEY_C), up(KEY_C), down(KEY_V), up(KEY_V), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, PlainTypingPassesThroughUntouched) {
++  harness_t h;
++  EXPECT_FALSE(h.press(KEY_A));
++  EXPECT_FALSE(h.release(KEY_A));
++  EXPECT_FALSE(h.press(vk::LEFT));
++  EXPECT_FALSE(h.release(vk::LEFT));
++  EXPECT_TRUE(h.take().empty());
++}
++
++TEST(MacKeymapTest, CmdShiftZKeepsShift) {
++  harness_t h;
++  h.shift = true;  // Shift itself travels the normal path
++  h.press(vk::LWIN);
++  h.press(KEY_Z);
++  h.release(KEY_Z);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(KEY_Z), up(KEY_Z), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, CmdTabHoldsAltUntilCmdIsReleased) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::TAB);
++  h.release(vk::TAB);
++  h.press(vk::TAB);
++  h.release(vk::TAB);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::LMENU), up(vk::RCONTROL), down(vk::TAB), up(vk::TAB), down(vk::TAB), up(vk::TAB), up(vk::LMENU)}));
++}
++
++TEST(MacKeymapTest, CmdBacktickCyclesWindowsOfTheApp) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::OEM_3);
++  h.release(vk::OEM_3);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::LMENU), up(vk::RCONTROL), down(vk::OEM_3), up(vk::OEM_3), up(vk::LMENU)}));
++}
++
++TEST(MacKeymapTest, OptionArrowsMoveByWordWithoutALoneAltTap) {
++  harness_t h;
++  h.press(vk::LMENU);
++  h.press(vk::LEFT);
++  h.release(vk::LEFT);
++  h.press(vk::RIGHT);
++  h.release(vk::RIGHT);
++  h.release(vk::LMENU);
++  // Ctrl goes down while Alt is still held, so Firefox & co. never see Alt pressed and released alone.
++  EXPECT_EQ(h.take(), (events_t {down(vk::LMENU), down(vk::RCONTROL), up(vk::LMENU), down(vk::LEFT), up(vk::LEFT), down(vk::RIGHT), up(vk::RIGHT), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, OptionBackspaceAndDeleteWorkOnWords) {
++  harness_t h;
++  h.press(vk::RMENU);
++  h.press(vk::BACK);
++  h.release(vk::BACK);
++  h.press(vk::DEL);
++  h.release(vk::DEL);
++  h.release(vk::RMENU);
++  EXPECT_EQ(h.take(), (events_t {down(vk::LMENU), down(vk::RCONTROL), up(vk::LMENU), down(vk::BACK), up(vk::BACK), down(vk::DEL), up(vk::DEL), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, OptionIsAltImmediatelyForGames) {
++  harness_t h;
++  h.press(vk::LMENU);
++  EXPECT_EQ(h.take(), (events_t {down(vk::LMENU)}));
++  h.press(KEY_B);
++  h.release(KEY_B);
++  h.release(vk::LMENU);
++  EXPECT_EQ(h.take(), (events_t {down(KEY_B), up(KEY_B), up(vk::LMENU)}));
++}
++
++TEST(MacKeymapTest, OptionAfterWordJumpReturnsToAlt) {
++  harness_t h;
++  h.press(vk::LMENU);
++  h.press(vk::LEFT);
++  h.release(vk::LEFT);
++  h.take();
++  h.press(KEY_B);
++  h.release(KEY_B);
++  h.release(vk::LMENU);
++  EXPECT_EQ(h.take(), (events_t {down(vk::LMENU), up(vk::RCONTROL), down(KEY_B), up(KEY_B), up(vk::LMENU)}));
++}
++
++TEST(MacKeymapTest, CmdArrowsJumpToLineAndDocumentEdges) {
++  harness_t h;
++  h.shift = true;
++  h.press(vk::LWIN);
++  h.press(vk::LEFT);
++  h.release(vk::LEFT);
++  h.press(vk::RIGHT);
++  h.release(vk::RIGHT);
++  h.press(vk::UP);
++  h.release(vk::UP);
++  h.press(vk::DOWN);
++  h.release(vk::DOWN);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(vk::HOME), up(vk::HOME), down(vk::END), up(vk::END), down(vk::RCONTROL), down(vk::HOME), up(vk::HOME), down(vk::END), up(vk::END), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, CmdBackspaceDeletesToLineStart) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::BACK);
++  h.release(vk::BACK);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(vk::LSHIFT), down(vk::HOME), up(vk::HOME), up(vk::LSHIFT), down(vk::BACK), up(vk::BACK)}));
++
++  h.shift = true;  // already held by the user: no extra Shift
++  h.press(vk::LWIN);
++  h.press(vk::BACK);
++  h.release(vk::BACK);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(vk::HOME), up(vk::HOME), down(vk::BACK), up(vk::BACK)}));
++}
++
++TEST(MacKeymapTest, CmdSpaceOpensSearch) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::SPACE);
++  h.release(vk::SPACE);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(vk::LWIN), up(vk::LWIN)}));
++}
++
++TEST(MacKeymapTest, CmdHAndCmdMHideTheWindow) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::KEY_M);
++  h.release(vk::KEY_M);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::LWIN), up(vk::RCONTROL), down(vk::KEY_H), up(vk::KEY_H), up(vk::LWIN)}));
++}
++
++TEST(MacKeymapTest, CmdBracketsGoBackAndForward) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::OEM_4);
++  h.release(vk::OEM_4);
++  h.press(vk::OEM_6);
++  h.release(vk::OEM_6);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::LMENU), up(vk::RCONTROL), down(vk::LEFT), up(vk::LEFT), down(vk::RIGHT), up(vk::RIGHT), up(vk::LMENU)}));
++}
++
++TEST(MacKeymapTest, CmdClickIsCtrlClickEvenAfterANavigationKey) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::LEFT);  // Home: Ctrl is lifted for it
++  h.release(vk::LEFT);
++  h.take();
++  h.t.pointer_button(h.host);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL)}));
++  h.t.pointer_button(h.host);  // already held: nothing more
++  EXPECT_TRUE(h.take().empty());
++}
++
++TEST(MacKeymapTest, PointerButtonWithoutModifiersDoesNothing) {
++  harness_t h;
++  h.t.pointer_button(h.host);
++  EXPECT_TRUE(h.take().empty());
++}
++
++TEST(MacKeymapTest, KeyReleasedAfterCmdStillReleasesItsHostKey) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(KEY_C);
++  h.release(vk::LWIN);
++  EXPECT_TRUE(h.release(KEY_C));  // must not leak to the normal path as a bare C release
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(KEY_C), up(vk::RCONTROL), up(KEY_C)}));
++}
++
++TEST(MacKeymapTest, BothCmdKeysKeepCtrlUntilTheLastIsReleased) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::RWIN);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL)}));
++  h.release(vk::RWIN);
++  EXPECT_EQ(h.take(), (events_t {up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, CmdOptionCombinesCtrlAndAlt) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::LMENU);
++  h.press(KEY_C);
++  h.release(KEY_C);
++  h.release(vk::LMENU);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::LMENU), down(KEY_C), up(KEY_C), up(vk::LMENU), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, RepeatedPressWithoutReleaseIsHealed) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(KEY_C);
++  h.press(KEY_C);  // the release got lost
++  h.release(KEY_C);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(KEY_C), up(KEY_C), down(KEY_C), up(KEY_C), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, TwoKeysMappedToTheSameHostKeyPressItOnce) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::LEFT);  // Home
++  h.press(vk::UP);  // Ctrl+Home
++  h.release(vk::LEFT);  // already released when Up took over
++  h.release(vk::UP);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(vk::HOME), up(vk::HOME), down(vk::RCONTROL), down(vk::HOME), up(vk::HOME), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, ResetReleasesEverything) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::LMENU);
++  h.press(KEY_C);
++  h.take();
++  h.t.reset(h.host);
++  const auto out = h.take();
++  std::multiset<std::uint16_t> released;
++  for (const auto &e : out) {
++    EXPECT_TRUE(e.release);
++    released.insert(e.vk);
++  }
++  EXPECT_EQ(released, (std::multiset<std::uint16_t> {KEY_C, vk::RCONTROL, vk::LMENU}));
++  // Nothing is held anymore: plain keys pass through again.
++  EXPECT_FALSE(h.press(KEY_A));
++}
++
++/**
++ * @brief Random client key storms never leave a host key stuck or released twice.
++ */
++TEST(MacKeymapTest, RandomSequencesNeverStickOrDoubleRelease) {
++  const std::vector<std::uint16_t> keys {vk::LWIN, vk::RWIN, vk::LMENU, vk::RMENU, KEY_A, KEY_C, KEY_V, vk::TAB, vk::OEM_3, vk::LEFT, vk::RIGHT, vk::UP, vk::DOWN, vk::BACK, vk::DEL, vk::SPACE, vk::KEY_H, vk::KEY_M, vk::OEM_4, vk::OEM_6};
++  std::mt19937 rng {1234};
++
++  for (int round = 0; round < 2000; ++round) {
++    translator_t t;
++    std::set<std::uint16_t> client_down;
++    std::map<std::uint16_t, int> host_down;  // what the translator pressed on the host
++    bool shift = rng() % 2;
++
++    auto apply = [&](const events_t &out) {
++      for (const auto &e : out) {
++        if (e.release) {
++          ASSERT_EQ(host_down[e.vk], 1) << "released a host key that was not down: " << e.vk;
++          host_down[e.vk] = 0;
++        } else {
++          ASSERT_EQ(host_down[e.vk], 0) << "pressed a host key twice: " << e.vk;
++          host_down[e.vk] = 1;
++        }
++      }
++    };
++
++    for (int step = 0; step < 40; ++step) {
++      const auto code = keys[rng() % keys.size()];
++      const bool release = client_down.contains(code) ? (rng() % 3 != 0) : false;  // sometimes a lost release
++      events_t out;
++      if (rng() % 17 == 0) {
++        t.pointer_button(out);
++      } else {
++        t.key(code, release, shift, out);
++        if (release) {
++          client_down.erase(code);
++        } else {
++          client_down.insert(code);
++        }
++      }
++      apply(out);
++    }
++
++    // The user lets go of everything, in random order.
++    std::vector<std::uint16_t> remaining(client_down.begin(), client_down.end());
++    std::shuffle(remaining.begin(), remaining.end(), rng);
++    for (const auto code : remaining) {
++      events_t out;
++      t.key(code, true, shift, out);
++      apply(out);
++    }
++
++    for (const auto &[code, n] : host_down) {
++      ASSERT_EQ(n, 0) << "host key stuck after all client keys were released: " << code << " (round " << round << ')';
++    }
++  }
++}
++
++#ifndef LIGHTPATH_STANDALONE_TEST
++// Through Sunshine's real keyboard path: packets in, recorded host keys out.
++  #include "src/config.h"
++  #include "src/input.h"
++  #include "src/platform/virtualhid_input.h"
++
++  #include <format>
++
++namespace {
++  using namespace std::chrono_literals;
++
++  class MacKeyboardPassthroughTest: public ::testing::Test {
++  protected:
++    void SetUp() override {
++      original_input_ = config::input;
++      config::input.keyboard = true;
++      config::input.mouse = true;
++      config::input.keybindings.clear();
++      config::input.key_rightalt_to_key_win = false;
++      config::input.key_repeat_delay = 0ms;
++      config::input.mac_shortcuts = true;
++
++      auto platform_input = platf::input();
++      ASSERT_TRUE(platform_input);
++      auto &context = platf::virtualhid::get_input_context(platform_input);
++      context = platf::virtualhid::input_context_t {lvh::BackendKind::fake};
++      input::testing::set_platform_input(std::move(platform_input));
++      input::testing::reset_keyboard_state();
++      input::testing::set_keyboard_sink([this](const input::testing::keyboard_event_t &event) {
++        events_.push_back(std::format("{}0x{:02X}", event.release ? '-' : '+', event.key_code));
++      });
++
++      static int session = 0;
++      stream_ = input::alloc(std::make_shared<safe::mail_raw_t>(), std::format("mac-keyboard-test-{}", ++session));
++      ASSERT_NE(stream_, nullptr);
++    }
++
++    void TearDown() override {
++      input::testing::set_keyboard_sink({});
++      input::testing::reset_keyboard_state();
++      stream_.reset();
++      input::testing::set_platform_input({});
++      config::input = std::move(original_input_);
++    }
++
++    void press(std::uint16_t key_code, unsigned modifiers = 0) {
++      input::testing::send_keyboard_packet(stream_, key_code, static_cast<std::uint8_t>(modifiers), 0, false);
++    }
++
++    void release(std::uint16_t key_code, unsigned modifiers = 0) {
++      input::testing::send_keyboard_packet(stream_, key_code, static_cast<std::uint8_t>(modifiers), 0, true);
++    }
++
++    std::vector<std::string> taken() {
++      return std::exchange(events_, {});
++    }
++
++    std::shared_ptr<input::input_t> stream_;
++    std::vector<std::string> events_;
++    config::input_t original_input_;
++  };
++}  // namespace
++
++TEST_F(MacKeyboardPassthroughTest, MacClientCmdCopyBecomesCtrlC) {
++  input::set_mac_client(stream_, true);
++  taken();
++  press(vk::LWIN, MODIFIER_META);
++  press(KEY_C, MODIFIER_META);
++  release(KEY_C, MODIFIER_META);
++  release(vk::LWIN);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA3", "+0x43", "-0x43", "-0xA3"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, OtherClientsKeepTheirWindowsKey) {
++  input::set_mac_client(stream_, false);
++  taken();
++  press(vk::LWIN, MODIFIER_META);
++  press(KEY_C, MODIFIER_META);
++  release(KEY_C, MODIFIER_META);
++  release(vk::LWIN);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0x5B", "+0x43", "-0x43", "-0x5B"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, ConfigSwitchTurnsTranslationOff) {
++  config::input.mac_shortcuts = false;
++  input::set_mac_client(stream_, true);
++  taken();
++  press(vk::LWIN, MODIFIER_META);
++  press(KEY_C, MODIFIER_META);
++  release(KEY_C, MODIFIER_META);
++  release(vk::LWIN);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0x5B", "+0x43", "-0x43", "-0x5B"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, OptionWordJumpNeverSynthesizesAlt) {
++  input::set_mac_client(stream_, true);
++  taken();
++  press(vk::LMENU, MODIFIER_ALT);
++  press(vk::LEFT, MODIFIER_ALT);
++  release(vk::LEFT, MODIFIER_ALT);
++  release(vk::LMENU);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA4", "+0xA3", "-0xA4", "+0x25", "-0x25", "-0xA3"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, StaleAltFlagDoesNotLeakIntoTyping) {
++  input::set_mac_client(stream_, true);
++  taken();
++  press(KEY_A, MODIFIER_ALT);  // Option is not held: the flag is stale
++  release(KEY_A);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0x41", "-0x41"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, MacCtrlAndShiftStillPassThrough) {
++  input::set_mac_client(stream_, true);
++  taken();
++  press(0xA2, MODIFIER_CTRL);  // Mac Ctrl (e.g. Ctrl+C in a terminal)
++  press(KEY_C, MODIFIER_CTRL);
++  release(KEY_C, MODIFIER_CTRL);
++  release(0xA2);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA2", "+0x43", "-0x43", "-0xA2"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, ResumingResetsTranslatorState) {
++  input::set_mac_client(stream_, true);
++  press(vk::LWIN, MODIFIER_META);
++  taken();
++  input::set_mac_client(stream_, true);  // a resumed connection
++  EXPECT_EQ(taken(), (std::vector<std::string> {"-0xA3"}));
++  press(KEY_A);
++  release(KEY_A);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0x41", "-0x41"}));
++}
++#endif
+diff --git a/tests/unit/test_video.cpp b/tests/unit/test_video.cpp
+index 8bb2991..489ff63 100644
+--- a/tests/unit/test_video.cpp
++++ b/tests/unit/test_video.cpp
+@@ -164,8 +164,24 @@ TEST(NvencAvcodecOptionsTest, UsesVersionStablePresetAndSpatialAqNames) {
+   for (const auto *codec : codecs) {
+     const auto preset = std::ranges::find(codec->common_options, "preset"sv, &video::encoder_t::option_t::name);
+     ASSERT_NE(codec->common_options.end(), preset);
+-    ASSERT_TRUE(std::holds_alternative<std::string *>(preset->value));
+-    EXPECT_EQ(&config::video.nv_legacy.preset, std::get<std::string *>(preset->value));
++    // The preset follows the stream bitrate (nvenc_preset_low_bitrate / nvenc_low_bitrate_kbps).
++    using preset_fn_t = std::function<const std::string(const video::config_t &)>;
++    ASSERT_TRUE(std::holds_alternative<preset_fn_t>(preset->value));
++    const auto &preset_for = std::get<preset_fn_t>(preset->value);
++    const auto saved = config::video.nv_legacy;
++    config::video.nv_legacy.preset = "p1";
++    config::video.nv_legacy.preset_low_bitrate = "p4";
++    config::video.nv_legacy.low_bitrate_kbps = 60000;
++    video::config_t stream {};
++    stream.bitrate = 150000;
++    EXPECT_EQ(preset_for(stream), "p1");
++    stream.bitrate = 60000;
++    EXPECT_EQ(preset_for(stream), "p4");
++    stream.bitrate = 20000;
++    EXPECT_EQ(preset_for(stream), "p4");
++    config::video.nv_legacy.preset_low_bitrate.clear();
++    EXPECT_EQ(preset_for(stream), "p1");
++    config::video.nv_legacy = saved;
+ 
+     const auto spatial_aq = std::ranges::find(codec->common_options, "spatial-aq"sv, &video::encoder_t::option_t::name);
+     ASSERT_NE(codec->common_options.end(), spatial_aq);
 -- 
 2.56.0
 
