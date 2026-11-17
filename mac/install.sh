@@ -26,33 +26,37 @@ die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*"; exit 1; }
 [ "$(uname)" = "Darwin" ] || die "This installer is for macOS."
 
 # ------------------------------------------------------------------ administrator access
-# Asked for only when something system-wide actually changes (first install, a new Wi-Fi helper
-# or Tailscale). Updates that only touch Moonlight and the lightpath command need no password.
+# Needed only for system-wide pieces: Tailscale (first install) and the Wi-Fi helper (first install
+# or when it changes). Everything else lives in your own folders, so ordinary updates never ask.
 # From Terminal sudo asks as usual; without a terminal (e.g. `lightpath update` started from an
-# app) macOS shows its normal password dialog instead.
+# app) macOS shows its normal password dialog instead. Saying no (or not being there) only skips
+# the system-wide piece; it never breaks the rest of the update.
 SUDO=(sudo)
-ROOT_READY=0
+ROOT_STATE=unknown  # unknown | ok | denied
 as_root() {
     if [ "$(id -u)" = 0 ]; then "$@"; return; fi
-    if [ "$ROOT_READY" = 0 ]; then
+    if [ "$ROOT_STATE" = unknown ]; then
+        ROOT_STATE=denied
         if ( : < /dev/tty ) 2>/dev/null; then
-            say "Lightpath needs your Mac password (to install its Wi-Fi helper)."
-            sudo -v < /dev/tty || die "Administrator access is required."
-            # Keep sudo alive while we work.
-            ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+            say "Lightpath needs your Mac password (for its Wi-Fi helper)."
+            if sudo -v < /dev/tty; then
+                ROOT_STATE=ok
+                # Keep sudo alive while we work.
+                ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+            fi
         else
             cat > "$WORK/askpass" <<'ASKPASS'
 #!/bin/bash
 # In front of other windows, and never waiting forever if nobody is at the Mac.
-exec /usr/bin/osascript -e 'tell me to activate' -e 'text returned of (display dialog "Lightpath needs your Mac password to finish updating." default answer "" with hidden answer with title "Lightpath" with icon caution giving up after 180)' 2>/dev/null
+exec /usr/bin/osascript -e 'tell me to activate' -e 'text returned of (display dialog "Lightpath needs your Mac password to update its Wi-Fi helper." default answer "" with hidden answer with title "Lightpath" with icon caution giving up after 180)' 2>/dev/null
 ASKPASS
             chmod 700 "$WORK/askpass"
             export SUDO_ASKPASS="$WORK/askpass"
             SUDO=(sudo -A)
-            "${SUDO[@]}" -v || die "Administrator access is required."
+            "${SUDO[@]}" -v 2>/dev/null && ROOT_STATE=ok
         fi
-        ROOT_READY=1
     fi
+    [ "$ROOT_STATE" = ok ] || return 1
     "${SUDO[@]}" "$@"
 }
 same_file() { [ -f "$2" ] && cmp -s "$1" "$2"; }
@@ -61,7 +65,8 @@ same_file() { [ -f "$2" ] && cmp -s "$1" "$2"; }
 if [ ! -d "$TS_APP" ]; then
     say "Installing Tailscale…"
     curl -fL --progress-bar "https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg" -o "$WORK/tailscale.pkg"
-    as_root installer -pkg "$WORK/tailscale.pkg" -target / >/dev/null
+    as_root installer -pkg "$WORK/tailscale.pkg" -target / >/dev/null \
+        || die "Tailscale needs your Mac password to install. Run the installer again."
 fi
 open -a "$TS_APP" || true
 say "Connecting to your PC through Tailscale…"
@@ -114,51 +119,21 @@ if pgrep -x Moonlight >/dev/null; then
     pkill -x Moonlight 2>/dev/null || true
 fi
 hdiutil attach -nobrowse -readonly -mountpoint "$WORK/mnt" "$WORK/Moonlight.dmg" >/dev/null
-rm -rf /Applications/Moonlight.app 2>/dev/null || as_root rm -rf /Applications/Moonlight.app
-ditto "$WORK/mnt/Moonlight.app" /Applications/Moonlight.app 2>/dev/null || as_root ditto "$WORK/mnt/Moonlight.app" /Applications/Moonlight.app
+{ rm -rf /Applications/Moonlight.app 2>/dev/null || as_root rm -rf /Applications/Moonlight.app; } \
+    && { ditto "$WORK/mnt/Moonlight.app" /Applications/Moonlight.app 2>/dev/null || as_root ditto "$WORK/mnt/Moonlight.app" /Applications/Moonlight.app; } \
+    || { hdiutil detach "$WORK/mnt" >/dev/null 2>&1; die "Couldn't replace /Applications/Moonlight.app. Run the installer again."; }
 hdiutil detach "$WORK/mnt" >/dev/null
 xattr -dr com.apple.quarantine /Applications/Moonlight.app 2>/dev/null || true
 
-# ------------------------------------------------------------------ helpers
+# ------------------------------------------------------------------ lightpath command
+# The real command lives in your Library (always updatable without a password); the Lightpath
+# apps call it there directly. /usr/local/bin/lightpath is a tiny pointer to it for Terminal.
 say "Installing the lightpath command…"
-# Owned by you, so later updates replace it without a password.
-if [ -w /usr/local/bin/lightpath ]; then
-    cat "$WORK/lightpath" > /usr/local/bin/lightpath
-else
-    as_root mkdir -p /usr/local/bin
-    as_root install -o "$(id -u)" -g "$(id -g)" -m 755 "$WORK/lightpath" /usr/local/bin/lightpath
-fi
-chmod 755 /usr/local/bin/lightpath
-if [ "$HAVE_TOOLS" = 1 ]; then
-    cat > "$WORK/awdl-guard.plist" <<'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>com.lightpath.awdl-guard</string>
-    <key>ProgramArguments</key>
-    <array><string>/usr/local/libexec/lightpath/awdl-guard</string></array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>ProcessType</key><string>Interactive</string>
-</dict>
-</plist>
-EOF
-    if same_file "$WORK/awdl-guard" "$LIBEXEC/awdl-guard" && same_file "$WORK/lightpath-wake" "$LIBEXEC/lightpath-wake" \
-            && same_file "$WORK/awdl-guard.plist" "$PLIST" && launchctl print system/com.lightpath.awdl-guard >/dev/null 2>&1; then
-        say "Wi-Fi helper is up to date."
-    else
-        say "Installing the Wi-Fi helper…"
-        as_root mkdir -p "$LIBEXEC"
-        as_root install -m 755 "$WORK/awdl-guard" "$WORK/lightpath-wake" "$LIBEXEC/"
-        as_root xattr -d com.apple.quarantine "$LIBEXEC/awdl-guard" "$LIBEXEC/lightpath-wake" 2>/dev/null || true
-        as_root install -o root -g wheel -m 644 "$WORK/awdl-guard.plist" "$PLIST"
-        as_root launchctl bootout system/com.lightpath.awdl-guard 2>/dev/null || true
-        as_root launchctl bootstrap system "$PLIST"
-    fi
-else
-    warn "Helper binaries aren't published yet; skipping the Wi-Fi helper for now."
-fi
+LP_DIR="$HOME/Library/Lightpath"
+LP_BIN="$LP_DIR/lightpath"
+mkdir -p "$LP_DIR"
+install -m 755 "$WORK/lightpath" "$LP_BIN"
+printf '#!/bin/bash\n# Lightpath: the command lives in your Library so updates need no password.\nexec "$HOME/Library/Lightpath/lightpath" "$@"\n' > "$WORK/lightpath-shim"
 
 # ------------------------------------------------------------------ Moonlight settings
 say "Tuning Moonlight…"
@@ -197,12 +172,58 @@ say "Creating the Lightpath app…"
 make_app() { # name, lightpath arguments
     local app="/Applications/$1.app"
     rm -rf "$app"
-    osacompile -o "$app" -e "do shell script \"/usr/local/bin/lightpath $2 >> /tmp/lightpath.log 2>&1 &\"" >/dev/null
+    osacompile -o "$app" -e "do shell script \"'$LP_BIN' $2 >> /tmp/lightpath.log 2>&1 &\"" >/dev/null
     cp /Applications/Moonlight.app/Contents/Resources/*.icns "$app/Contents/Resources/applet.icns" 2>/dev/null || true
     touch "$app"
 }
 make_app "Lightpath" "connect"
 make_app "Lightpath Steam" "steam"
+
+# ------------------------------------------------------------------ system-wide pieces (password)
+NEED_PASSWORD_LATER=0
+if ! same_file "$WORK/lightpath-shim" /usr/local/bin/lightpath; then
+    if { [ -w /usr/local/bin/lightpath ] || { [ ! -e /usr/local/bin/lightpath ] && [ -w /usr/local/bin ]; }; } \
+            && cp "$WORK/lightpath-shim" /usr/local/bin/lightpath 2>/dev/null; then
+        chmod 755 /usr/local/bin/lightpath
+    elif as_root mkdir -p /usr/local/bin && as_root install -m 755 "$WORK/lightpath-shim" /usr/local/bin/lightpath; then
+        :
+    else
+        NEED_PASSWORD_LATER=1
+    fi
+fi
+if [ "$HAVE_TOOLS" = 1 ]; then
+    cat > "$WORK/awdl-guard.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.lightpath.awdl-guard</string>
+    <key>ProgramArguments</key>
+    <array><string>/usr/local/libexec/lightpath/awdl-guard</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+EOF
+    if same_file "$WORK/awdl-guard" "$LIBEXEC/awdl-guard" && same_file "$WORK/lightpath-wake" "$LIBEXEC/lightpath-wake" \
+            && same_file "$WORK/awdl-guard.plist" "$PLIST" && pgrep -x awdl-guard >/dev/null; then
+        say "Wi-Fi helper is up to date."
+    else
+        say "Installing the Wi-Fi helper…"
+        if as_root mkdir -p "$LIBEXEC" \
+                && as_root install -m 755 "$WORK/awdl-guard" "$WORK/lightpath-wake" "$LIBEXEC/" \
+                && as_root install -o root -g wheel -m 644 "$WORK/awdl-guard.plist" "$PLIST"; then
+            as_root xattr -d com.apple.quarantine "$LIBEXEC/awdl-guard" "$LIBEXEC/lightpath-wake" 2>/dev/null || true
+            as_root launchctl bootout system/com.lightpath.awdl-guard 2>/dev/null || true
+            as_root launchctl bootstrap system "$PLIST" || warn "The Wi-Fi helper didn't start; it will on the next restart."
+        else
+            NEED_PASSWORD_LATER=1
+        fi
+    fi
+else
+    warn "Helper binaries aren't published yet; skipping the Wi-Fi helper for now."
+fi
 
 # ------------------------------------------------------------------ pair
 if defaults read com.moonlight-stream.Moonlight 2>/dev/null | grep -q srvcert; then
@@ -210,7 +231,7 @@ if defaults read com.moonlight-stream.Moonlight 2>/dev/null | grep -q srvcert; t
     PAIRED=1
 else
     say "Pairing with your PC (automatic)…"
-    if /usr/local/bin/lightpath pair; then
+    if "$LP_BIN" pair; then
         PAIRED=1
     else
         PAIRED=0
@@ -223,3 +244,4 @@ echo "  • Open \"Lightpath Steam\" to go straight to Steam Big Picture."
 echo "  • Screen: ${W}x${H} at 120 Hz. Press Ctrl+Option+Shift+Q to stop streaming."
 echo "  • Mac shortcuts work on the PC (Cmd+C/V, Cmd+Tab, Option+arrows…), copy/paste is shared."
 [ "$PAIRED" = 1 ] || warn "Pairing didn't finish. Turn the PC on and run: lightpath pair"
+[ "$NEED_PASSWORD_LATER" = 0 ] || warn "Everything is updated except a system piece that needs your Mac password; it'll ask again next update (everything works meanwhile)."
