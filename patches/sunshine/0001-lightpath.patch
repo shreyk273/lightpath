@@ -1,4 +1,4 @@
-From 58b7f6fe6b008db1ec546cebb675fe9c2f919a2b Mon Sep 17 00:00:00 2001
+From 8fa67202dd9b8ae5707403ca0407a9790416ea9d Mon Sep 17 00:00:00 2001
 From: Shreyansh Kaushik <smkaushi@ucsc.edu>
 Date: Tue, 17 Nov 2026 00:23:24 -0800
 Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
@@ -12,11 +12,11 @@ Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
  src/config.h                          |   1 +
  src/platform/common.h                 |   9 +
  src/platform/linux/misc.cpp           |  34 +
- src/platform/linux/muttergrab.cpp     | 912 ++++++++++++++++++++++++++
+ src/platform/linux/muttergrab.cpp     | 928 ++++++++++++++++++++++++++
  src/platform/linux/pipewire.cpp       |  77 ++-
  src/rtsp.cpp                          |  72 ++
  src/video.cpp                         |   9 +
- 11 files changed, 1116 insertions(+), 16 deletions(-)
+ 11 files changed, 1132 insertions(+), 16 deletions(-)
  create mode 100644 src/platform/linux/muttergrab.cpp
 
 diff --git a/cmake/compile_definitions/linux.cmake b/cmake/compile_definitions/linux.cmake
@@ -200,10 +200,10 @@ index 9e2d2a7..58c4905 100644
        sources[source::PORTAL] = true;
 diff --git a/src/platform/linux/muttergrab.cpp b/src/platform/linux/muttergrab.cpp
 new file mode 100644
-index 0000000..c44fa00
+index 0000000..5c57f15
 --- /dev/null
 +++ b/src/platform/linux/muttergrab.cpp
-@@ -0,0 +1,912 @@
+@@ -0,0 +1,928 @@
 +/**
 + * @file src/platform/linux/muttergrab.cpp
 + * @brief GNOME (Mutter) virtual display capture.
@@ -261,6 +261,7 @@ index 0000000..c44fa00
 +    constexpr auto STREAM_ADDED_TIMEOUT = 5s;
 +    constexpr auto LAYOUT_SETTLE_TIMEOUT = 3s;
 +    constexpr auto LINGER = 5s;  ///< Keep the virtual monitor across quick capture re-inits.
++    constexpr auto BLANK_DELAY = 1500ms;  ///< Let the stream start before power-cycling outputs.
 +
 +    /**
 +     * @brief Read an environment variable as a double.
@@ -657,7 +658,9 @@ index 0000000..c44fa00
 +        );
 +        if (reply) {
 +          BOOST_LOG(info) << "[muttergrab] "sv << connector << " is now the only display (scale "sv << scale << ')';
-+          blank_detached_outputs(*state);
++          detached_physical = std::ranges::any_of(state->active_connectors, [this](const auto &c) {
++            return c != connector && !c.starts_with("Meta-");
++          });
 +          return true;
 +        }
 +        // A monitor hotplug between GetCurrentState and ApplyMonitorsConfig makes the serial stale; retry.
@@ -698,6 +701,7 @@ index 0000000..c44fa00
 +    int height = 0;  ///< Virtual monitor height.
 +    double scale = 1;  ///< Applied logical monitor scale.
 +    uint32_t inhibit_cookie = 0;  ///< Session manager inhibitor cookie.
++    bool detached_physical = false;  ///< Whether make_exclusive() removed physical outputs.
 +
 +  private:
 +    /**
@@ -804,28 +808,6 @@ index 0000000..c44fa00
 +    }
 +
 +    /**
-+     * @brief Turn off the physical outputs that were just removed from the layout.
-+     *
-+     * Some drivers keep scanning out the last frame of a monitor that is no longer part of the
-+     * layout. A short display power-save cycle makes Mutter re-enable only the outputs that are
-+     * still configured, so the physical screen goes dark instead of freezing.
-+     *
-+     * @param previous State before the layout change.
-+     */
-+    void blank_detached_outputs(const display_state_t &previous) const {
-+      const bool had_physical = std::ranges::any_of(previous.active_connectors, [this](const auto &c) {
-+        return c != connector && !c.starts_with("Meta-");
-+      });
-+      if (!had_physical || env_flag("SUNSHINE_MUTTER_NO_BLANK")) {
-+        return;
-+      }
-+      for (const int mode : {3, 0}) {
-+        g_autoptr(GVariant) r = conn.call(DISPLAY_CONFIG_BUS, DISPLAY_CONFIG_PATH, "org.freedesktop.DBus.Properties", "Set", g_variant_new("(ssv)", DISPLAY_CONFIG_IFACE, "PowerSaveMode", g_variant_new_int32(mode)), nullptr);
-+        std::this_thread::sleep_for(150ms);
-+      }
-+    }
-+
-+    /**
 +     * @brief Extract the object path from a "(o)" reply.
 +     *
 +     * @param reply Reply variant.
@@ -837,6 +819,37 @@ index 0000000..c44fa00
 +      return path;
 +    }
 +  };
++
++  /**
++   * @brief Turn off physical outputs that were removed from the layout, once the stream runs.
++   *
++   * Some drivers (NVIDIA) keep scanning out the last frame of a monitor that is no longer part
++   * of the layout, so a projector or TV would show a frozen picture for the whole stream. A
++   * display power-save cycle makes Mutter re-enable only the outputs that are still configured.
++   * It is done a moment after capture started, from a separate thread and D-Bus connection,
++   * so it never delays the first frame; the stream sees at most a sub-second hiccup.
++   *
++   * @param weak Session that detached the outputs; nothing happens if it is already gone.
++   */
++  void blank_detached_outputs_later(std::weak_ptr<screencast_session_t> weak) {
++    std::thread([weak = std::move(weak)]() {
++      std::this_thread::sleep_for(BLANK_DELAY);
++      const auto session = weak.lock();
++      if (!session) {
++        return;
++      }
++      connection_t conn;
++      if (!conn.open()) {
++        return;
++      }
++      const auto start = std::chrono::steady_clock::now();
++      for (const int mode : {3, 0}) {
++        g_autoptr(GVariant) r = conn.call(DISPLAY_CONFIG_BUS, DISPLAY_CONFIG_PATH, "org.freedesktop.DBus.Properties", "Set", g_variant_new("(ssv)", DISPLAY_CONFIG_IFACE, "PowerSaveMode", g_variant_new_int32(mode)), nullptr);
++      }
++      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
++      BOOST_LOG(info) << "[muttergrab] Switched off the physical displays removed from the layout ("sv << ms << " ms)"sv;
++    }).detach();
++  }
 +
 +  /**
 +   * @brief Shares one virtual monitor between consecutive capture objects of a stream.
@@ -884,6 +897,9 @@ index 0000000..c44fa00
 +          BOOST_LOG(warning) << "[muttergrab] Could not make the virtual display exclusive; it will extend the desktop instead"sv;
 +        }
 +        session->wait_for_layout(true);
++        if (session->detached_physical && !env_flag("SUNSHINE_MUTTER_NO_BLANK")) {
++          blank_detached_outputs_later(session);
++        }
 +      } else {
 +        session->wait_for_layout(false);
 +      }
