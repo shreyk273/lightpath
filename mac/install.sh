@@ -43,7 +43,8 @@ as_root() {
         else
             cat > "$WORK/askpass" <<'ASKPASS'
 #!/bin/bash
-exec /usr/bin/osascript -e 'display dialog "Lightpath needs your Mac password to install its Wi-Fi helper." default answer "" with hidden answer with title "Lightpath" with icon caution' -e 'text returned of result' 2>/dev/null
+# In front of other windows, and never waiting forever if nobody is at the Mac.
+exec /usr/bin/osascript -e 'tell me to activate' -e 'text returned of (display dialog "Lightpath needs your Mac password to finish updating." default answer "" with hidden answer with title "Lightpath" with icon caution giving up after 180)' 2>/dev/null
 ASKPASS
             chmod 700 "$WORK/askpass"
             export SUDO_ASKPASS="$WORK/askpass"
