@@ -1,0 +1,12 @@
+[Unit]
+Description=Lightpath agent (Tailscale-authenticated pairing, wake intent, speed test)
+After=network-online.target tailscaled.service
+
+[Service]
+ExecStart=/usr/bin/python3 -u %h/.local/share/lightpath/lightpath-agent.py
+Restart=always
+RestartSec=3
+Environment=LIGHTPATH_BASE_PORT=48989
+
+[Install]
+WantedBy=default.target
