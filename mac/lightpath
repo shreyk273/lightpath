@@ -119,6 +119,14 @@ send_wake() {
     [ -n "$mac" ] || die "I don't know the PC's network address yet. Run 'lightpath pair' once while the PC is on."
     # shellcheck disable=SC2046
     "$LIBEXEC/lightpath-wake" "$mac" $(wake_targets | sort -u) >/dev/null 2>&1 || true
+    # Always-on helper at home (e.g. the Kindle hub) that wakes the PC from anywhere.
+    # Asked on the first round and then every ~16 s (the wait loop calls us every 2 s).
+    WAKE_ROUND=$(( ${WAKE_ROUND:-0} + 1 ))
+    local relay
+    relay="$(json "$HOSTJSON" wake_relay)"
+    if [ -n "$relay" ] && [ $(( WAKE_ROUND % 8 )) -eq 1 ]; then
+        curl -fsS -m 5 -d wake "$relay" >/dev/null 2>&1 || true
+    fi
 }
 
 wake_and_wait() {

@@ -33,6 +33,7 @@ from pathlib import Path
 PORT = int(os.environ.get("LIGHTPATH_AGENT_PORT", "48900"))
 SUNSHINE_PORT = int(os.environ.get("LIGHTPATH_BASE_PORT", "48989"))
 CRED_FILE = Path.home() / ".config/lightpath/sunshine-web.cred"
+WAKE_RELAY_FILE = Path.home() / ".config/lightpath/wake-relay"  # e.g. https://ntfy.sh/<secret topic>
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "lightpath"
 INTENT_FILE = RUNTIME / "remote-wake"
 NOISE = secrets.token_bytes(1 << 20)  # 1 MiB of random bytes, reused for speed tests
@@ -134,6 +135,15 @@ def stream_active():
     return bool(re.search(r"Monitor Meta-\d+", out))
 
 
+def wake_relay():
+    """URL of an always-on device's wake relay (see README: waking from anywhere), if set up."""
+    try:
+        url = WAKE_RELAY_FILE.read_text().strip()
+    except OSError:
+        return None
+    return url if url.startswith("https://") else None
+
+
 def status():
     return {
         "name": socket.gethostname(),
@@ -141,6 +151,7 @@ def status():
         "lan": lan_info(),
         "tailscale": tailscale_info(),
         "streaming": stream_active(),
+        "wake_relay": wake_relay(),
         "time": int(time.time()),
     }
 
