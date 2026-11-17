@@ -1,0 +1,9 @@
+[Unit]
+Description=Lightpath: watch the Steam library for installs and uninstalls
+
+[Path]
+PathChanged=%h/.local/share/Steam/steamapps
+Unit=lightpath-steam-apps.service
+
+[Install]
+WantedBy=default.target

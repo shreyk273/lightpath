@@ -35,9 +35,11 @@ fi
 log "Agent"
 mkdir -p "$HOME/.local/share/lightpath" "$HOME/.config/systemd/user"
 install -m 755 "$ROOT/host/agent/lightpath-agent.py" "$HOME/.local/share/lightpath/"
-install -m 644 "$ROOT/host/systemd/lightpath-agent.service" "$HOME/.config/systemd/user/"
+install -m 755 "$ROOT/host/tools/steam-apps.py" "$HOME/.local/share/lightpath/"
+install -m 644 "$ROOT"/host/systemd/lightpath-*.service "$ROOT"/host/systemd/lightpath-*.path "$HOME/.config/systemd/user/"
 
 systemctl --user daemon-reload
-systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service lightpath-agent.service
+systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service lightpath-agent.service \
+  lightpath-steam-apps.service lightpath-steam-apps.path
 systemctl --user restart app-dev.lizardbyte.app.Sunshine.service lightpath-agent.service
 log "Done. Web UI: https://localhost:48990 (credentials in $CRED)"

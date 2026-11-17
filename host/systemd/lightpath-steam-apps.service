@@ -1,0 +1,10 @@
+[Unit]
+Description=Lightpath: publish installed Steam games to Sunshine
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/share/lightpath/steam-apps.py
+
+[Install]
+WantedBy=default.target
