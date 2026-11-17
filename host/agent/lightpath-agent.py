@@ -136,6 +136,97 @@ def stream_active():
     return bool(re.search(r"Monitor Meta-\d+", out))
 
 
+# --------------------------------------------------------------------------- speakers
+# While a client streams, Sunshine makes its own virtual sink the default output; it is meant
+# to switch back afterwards but can fail (a broken PulseAudio context), and the projector's HDMI
+# output vanishes while its screen is off for the stream. This guard keeps the user's speakers:
+# it remembers the last output the user picked and puts sound back on it whenever no stream runs.
+SPEAKERS_FILE = Path.home() / ".config/lightpath/speakers"
+STREAM_GRACE = 10  # seconds after a stream during which output changes are Sunshine's, not the user's
+
+
+def _is_virtual_sink(name):
+    return name.startswith("sink-sunshine") or ".monitor" in name or name.startswith("auto_null")
+
+
+def _sinks():
+    return [line.split("\t")[1] for line in run("pactl", "list", "short", "sinks").splitlines() if "\t" in line]
+
+
+class SpeakerGuard:
+    def __init__(self):
+        try:
+            self.preferred = SPEAKERS_FILE.read_text().strip() or None
+        except OSError:
+            self.preferred = None
+        self.last_default = None
+        self.last_sinks = []
+        self.last_stream = 0.0
+        self.timer = None
+        self.lock = threading.Lock()
+
+    def remember(self, sink):
+        if sink != self.preferred:
+            self.preferred = sink
+            SPEAKERS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            SPEAKERS_FILE.write_text(sink + "\n")
+            log(f"speakers: remembering {sink}")
+
+    def check(self):
+        with self.lock:
+            default = run("pactl", "get-default-sink").strip()
+            sinks = _sinks()
+            # Asking GNOME about the stream costs a process spawn: only when something differs.
+            active = (default != self.preferred or default != self.last_default) and stream_active()
+            if active:
+                self.last_stream = time.time()
+            streaming_recently = time.time() - self.last_stream < STREAM_GRACE
+            if self.preferred is None and default and not _is_virtual_sink(default):
+                self.remember(default)
+            elif (default and default != self.last_default and not _is_virtual_sink(default)
+                  and not streaming_recently and self.last_default in sinks):
+                # The previous output still exists, so this was a choice, not a fallback.
+                self.remember(default)
+            if (not active and self.preferred and self.preferred in sinks
+                    and default != self.preferred):
+                run("pactl", "set-default-sink", self.preferred)
+                for line in run("pactl", "list", "short", "sink-inputs").splitlines():
+                    run("pactl", "move-sink-input", line.split("\t")[0], self.preferred)
+                log(f"speakers: sound back on {self.preferred} (was {default or 'nothing'})")
+                default = self.preferred
+            self.last_default, self.last_sinks = default, sinks
+
+    def poke(self, delay=1.0):
+        if self.timer:
+            self.timer.cancel()
+        self.timer = threading.Timer(delay, self.check)
+        self.timer.daemon = True
+        self.timer.start()
+
+    def run_forever(self):
+        while True:
+            try:
+                proc = subprocess.Popen(["pactl", "subscribe"], stdout=subprocess.PIPE, text=True)
+            except OSError:
+                time.sleep(10)
+                continue
+            self.check()
+            for line in proc.stdout:
+                if " on server" in line or " on sink #" in line:
+                    self.poke()
+            proc.wait()
+            time.sleep(3)  # PipeWire restarted
+
+
+def speaker_guard_forever():
+    guard = SpeakerGuard()
+    # Also re-check periodically: the stream's virtual display leaving is not an audio event.
+    threading.Thread(target=guard.run_forever, daemon=True).start()
+    while True:
+        time.sleep(5)
+        guard.check()
+
+
 def wake_relay():
     """URL of an always-on device's wake relay (see README: waking from anywhere), if set up."""
     try:
@@ -336,6 +427,7 @@ def main():
     srv = Server(("::", PORT), Handler)
     log(f"lightpath-agent listening on port {PORT}")
     threading.Thread(target=self_user_id, daemon=True).start()
+    threading.Thread(target=speaker_guard_forever, daemon=True).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
