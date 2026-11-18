@@ -37,6 +37,8 @@ mkdir -p "$HOME/.local/share/lightpath" "$HOME/.config/systemd/user"
 install -m 755 "$ROOT/host/agent/lightpath-agent.py" "$HOME/.local/share/lightpath/"
 install -m 755 "$ROOT/host/tools/steam-apps.py" "$HOME/.local/share/lightpath/"
 install -m 644 "$ROOT"/host/systemd/lightpath-*.service "$ROOT"/host/systemd/lightpath-*.path "$HOME/.config/systemd/user/"
+mkdir -p "$HOME/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d"
+install -m 644 "$ROOT"/host/systemd/sunshine.d/lightpath.conf "$HOME/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/"
 
 systemctl --user daemon-reload
 systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service lightpath-agent.service \
