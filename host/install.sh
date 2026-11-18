@@ -40,6 +40,14 @@ install -m 644 "$ROOT"/host/systemd/lightpath-*.service "$ROOT"/host/systemd/lig
 mkdir -p "$HOME/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d"
 install -m 644 "$ROOT"/host/systemd/sunshine.d/lightpath.conf "$HOME/.config/systemd/user/app-dev.lizardbyte.app.Sunshine.service.d/"
 
+log "GNOME helper (focused window, for Mac shortcuts in terminals)"
+EXT=lightpath@lightpath.local
+mkdir -p "$HOME/.local/share/gnome-shell/extensions/$EXT"
+install -m 644 "$ROOT/host/gnome-extension/$EXT"/{metadata.json,extension.js} "$HOME/.local/share/gnome-shell/extensions/$EXT/"
+# GNOME picks up a new extension at the next login; enabling it now makes that automatic.
+gnome-extensions enable "$EXT" 2>/dev/null \
+  || gsettings set org.gnome.shell enabled-extensions "$(python3 -c 'import ast,sys; l=ast.literal_eval(sys.argv[1] or "[]"); print(l if sys.argv[2] in l else l+[sys.argv[2]])' "$(gsettings get org.gnome.shell enabled-extensions | sed 's/^@as //')" "$EXT")"
+
 systemctl --user daemon-reload
 systemctl --user enable --now app-dev.lizardbyte.app.Sunshine.service lightpath-agent.service \
   lightpath-steam-apps.service lightpath-steam-apps.path

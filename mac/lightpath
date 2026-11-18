@@ -145,6 +145,9 @@ wake_and_wait() {
     start=$(date +%s)
     while [ $(( $(date +%s) - start )) -lt "$WAKE_TIMEOUT" ]; do
         send_wake
+        # Leave a "keep the projector off" note as early as the PC can take it: it decides
+        # about the projector a few seconds after waking, often before Sunshine answers.
+        curl -fsS -m 1 -X POST "http://$(ts_ip):$AGENT_PORT/wake-intent" >/dev/null 2>&1 &
         sleep 2
         if r="$(route)"; then
             # Tell the PC this was a remote wake so it leaves the projector off.

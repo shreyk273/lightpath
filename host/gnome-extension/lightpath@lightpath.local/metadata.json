@@ -1,0 +1,7 @@
+{
+  "uuid": "lightpath@lightpath.local",
+  "name": "Lightpath Helper",
+  "description": "Tells Lightpath's streaming server which window has focus, so Mac shortcuts do the right thing (for example Cmd+C copies in a terminal).",
+  "shell-version": ["46", "47", "48", "49", "50", "51", "52"],
+  "version": 1
+}

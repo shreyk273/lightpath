@@ -1,4 +1,4 @@
-From f6b923acb8ffeb28e7673519847049f9682376ba Mon Sep 17 00:00:00 2001
+From f2cbe1cc89c7d24e2cd085aff4b0bcbd44b2a4ba Mon Sep 17 00:00:00 2001
 From: Shreyansh Kaushik <smkaushi@ucsc.edu>
 Date: Tue, 17 Nov 2026 00:23:24 -0800
 Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
@@ -19,14 +19,14 @@ Claude-Session: https://claude.ai/code/session_01JSGYnegbZ8CEyDK2p2YTH2
  docs/configuration.md                         | 108 +-
  src/config.cpp                                |  14 +
  src/config.h                                  |   6 +
- src/input.cpp                                 |  81 ++
+ src/input.cpp                                 |  97 ++
  src/input.h                                   |  11 +
- src/mac_keymap.h                              | 341 +++++++
+ src/mac_keymap.h                              | 553 +++++++++++
  src/nvhttp.cpp                                | 120 ++-
  src/platform/common.h                         |   9 +
  src/platform/linux/misc.cpp                   |  40 +-
- src/platform/linux/mutter_rd.cpp              | 607 ++++++++++++
- src/platform/linux/mutter_rd.h                | 101 ++
+ src/platform/linux/mutter_rd.cpp              | 714 ++++++++++++++
+ src/platform/linux/mutter_rd.h                | 124 +++
  src/platform/linux/muttergrab.cpp             | 928 ++++++++++++++++++
  src/platform/linux/pipewire.cpp               |  77 +-
  src/rtsp.cpp                                  |  72 ++
@@ -37,9 +37,9 @@ Claude-Session: https://claude.ai/code/session_01JSGYnegbZ8CEyDK2p2YTH2
  .../common/assets/web/configs/tabs/Inputs.vue |  16 +
  .../tabs/encoders/NvidiaNvencEncoder.vue      |  23 +-
  .../assets/web/public/assets/locale/en.json   |   9 +
- tests/unit/test_mac_keymap.cpp                | 550 +++++++++++
+ tests/unit/test_mac_keymap.cpp                | 679 +++++++++++++
  tests/unit/test_video.cpp                     |  20 +-
- 25 files changed, 3161 insertions(+), 27 deletions(-)
+ 25 files changed, 3648 insertions(+), 27 deletions(-)
  create mode 100644 src/mac_keymap.h
  create mode 100644 src/platform/linux/mutter_rd.cpp
  create mode 100644 src/platform/linux/mutter_rd.h
@@ -284,7 +284,7 @@ index dc890e2..14ba19f 100644
  
    namespace flag {
 diff --git a/src/input.cpp b/src/input.cpp
-index a6afa54..b161cca 100644
+index a6afa54..8066c68 100644
 --- a/src/input.cpp
 +++ b/src/input.cpp
 @@ -33,7 +33,11 @@ extern "C" {
@@ -360,25 +360,33 @@ index a6afa54..b161cca 100644
    /**
     * @brief Forward a client input packet directly to the platform backend.
     *
-@@ -1241,6 +1276,17 @@ namespace input {
+@@ -1241,6 +1276,25 @@ namespace input {
        }
      }
  
 +    if (mac_shortcuts(*input)) {
++#ifdef __linux__
++      input->mac_keys.set_terminal(mutter_rd::terminal_focused());
++#endif
 +      mac_keymap::events_t events;
 +      if (input->mac_keys.key(keyCode, release, input->shift_keys.any_pressed(), events)) {
 +        emit_mac_events(events);
++        if (keyCode == VKEY_CONTROL || keyCode == VKEY_LCONTROL || keyCode == VKEY_RCONTROL) {
++          // The translator owns Control now, but pinch-to-zoom (Ctrl + wheel) still needs to
++          // know it is held.
++          update_modifier_state(*input, keyCode, release);
++        }
 +        return;
 +      }
-+      // Cmd and Option belong to the translator; keys reaching the normal path are typed
-+      // without them, so never synthesize Alt from the packet's modifier flags.
-+      modifiers &= ~MODIFIER_ALT;
++      // Cmd, Option and Control belong to the translator, which already holds the host
++      // modifiers they stand for: never synthesize Ctrl or Alt from the packet's flags.
++      modifiers &= ~(MODIFIER_ALT | MODIFIER_CTRL);
 +    }
 +
      update_modifier_state(*input, keyCode, release);
  
      // Right-alt maps to meta, so it must not also register as ALT
-@@ -1309,6 +1355,17 @@ namespace input {
+@@ -1309,6 +1363,17 @@ namespace input {
      if (!config::input.mouse) {
        return;
      }
@@ -396,7 +404,7 @@ index a6afa54..b161cca 100644
  
      if (config::input.high_resolution_scrolling) {
        platf::scroll(platf_input, util::endian::big(packet->scrollAmt1));
-@@ -1332,6 +1389,14 @@ namespace input {
+@@ -1332,6 +1397,14 @@ namespace input {
      if (!config::input.mouse) {
        return;
      }
@@ -411,7 +419,7 @@ index a6afa54..b161cca 100644
  
      if (config::input.high_resolution_scrolling) {
        platf::hscroll(platf_input, util::endian::big(packet->scrollAmount));
-@@ -2371,6 +2436,9 @@ namespace input {
+@@ -2371,6 +2444,9 @@ namespace input {
     * @param input Retained stream input state to reset.
     */
    void reset_input_state(const std::shared_ptr<input_t> &input) {
@@ -421,7 +429,7 @@ index a6afa54..b161cca 100644
      reset_mouse_buttons();
      reset_keyboard_keys();
      reset_gamepads(input);
-@@ -2512,6 +2580,19 @@ namespace input {
+@@ -2512,6 +2588,27 @@ namespace input {
      return input;
    }
  
@@ -432,6 +440,14 @@ index a6afa54..b161cca 100644
 +      input->mac_keys.reset(events);
 +      emit_mac_events(events);
 +      input->mac_client = mac;
++#ifdef __linux__
++      if (mac) {
++        // Cmd+Shift+3 / 4 trigger whatever the PC uses for screenshots.
++        const auto full = mac_keymap::parse_accel(mutter_rd::desktop_shortcut("org.gnome.shell.keybindings", "screenshot"));
++        const auto tool = mac_keymap::parse_accel(mutter_rd::desktop_shortcut("org.gnome.shell.keybindings", "show-screenshot-ui"));
++        input->mac_keys.set_screenshot_shortcuts(full.value_or(mac_keymap::chord_t {false, false, false, true, 0x2C}), tool.value_or(mac_keymap::chord_t {false, false, false, false, 0x2C}));
++      }
++#endif
 +    });
 +    if (mac) {
 +      BOOST_LOG(info) << "Mac client: macOS shortcuts "sv << (config::input.mac_shortcuts ? "on"sv : "off"sv) << ", pixel-precise trackpad scrolling"sv;
@@ -465,10 +481,10 @@ index 41e0439..d63eb64 100644
      /**
 diff --git a/src/mac_keymap.h b/src/mac_keymap.h
 new file mode 100644
-index 0000000..83a1749
+index 0000000..29717d5
 --- /dev/null
 +++ b/src/mac_keymap.h
-@@ -0,0 +1,341 @@
+@@ -0,0 +1,553 @@
 +/**
 + * @file src/mac_keymap.h
 + * @brief macOS keyboard semantics for Mac clients streaming a Linux/Windows desktop.
@@ -480,30 +496,38 @@ index 0000000..83a1749
 + * | Mac                      | Host                          |
 + * |--------------------------|-------------------------------|
 + * | Cmd + key                | Ctrl + key                    |
++ * | Cmd + key in a terminal  | Ctrl + Shift + key (copy, paste, new tab, ...) |
 + * | Cmd + click              | Ctrl + click                  |
++ * | Control + Cmd + key      | Super + key (the PC's own Super shortcuts) |
++ * | Cmd tapped alone         | Super (Activities overview)   |
 + * | Cmd + Tab / Cmd + `      | Alt + Tab / Alt + ` (held)    |
 + * | Cmd + Left / Right       | Home / End                    |
 + * | Cmd + Up / Down          | Ctrl + Home / Ctrl + End      |
 + * | Cmd + Backspace          | delete to line start          |
-+ * | Cmd tapped alone         | Super (Activities overview)   |
 + * | Cmd + Space              | Super (search)                |
 + * | Cmd + H / Cmd + M        | Super + H (hide window)       |
 + * | Cmd + [ / Cmd + ]        | Alt + Left / Alt + Right      |
++ * | Cmd + Shift + 3          | the PC's full-screen screenshot shortcut |
++ * | Cmd + Shift + 4 / 5      | the PC's screenshot tool      |
 + * | Option + arrows          | Ctrl + arrows (word/paragraph)|
 + * | Option + Backspace / Del | Ctrl + Backspace / Delete     |
 + * | Option + other key       | Alt + key                     |
++ * | Control + key            | Ctrl + key (Ctrl+C still interrupts in a terminal) |
 + *
-+ * Shift and Ctrl pass through untouched, so Cmd+Shift+Z is Ctrl+Shift+Z and Shift+Option+Left
++ * Shift passes through untouched, so Cmd+Shift+Z is Ctrl+Shift+Z and Shift+Option+Left
 + * selects a word. Host modifiers are always pressed before stale ones are released, so no
 + * application ever sees a lone Alt tap (which would toggle menu bars).
 + *
 + * The translator is pure: it emits host key events into a vector and owns no I/O, which keeps
-+ * it trivially testable.
++ * it trivially testable. What it cannot see (whether a terminal has focus, the PC's screenshot
++ * shortcuts) is handed to it by the caller.
 + */
 +#pragma once
 +
 +// standard includes
 +#include <cstdint>
++#include <optional>
++#include <string_view>
 +#include <unordered_map>
 +#include <vector>
 +
@@ -526,9 +550,22 @@ index 0000000..83a1749
 +    constexpr std::uint16_t KEY_M = 0x4D;
 +    constexpr std::uint16_t LWIN = 0x5B;
 +    constexpr std::uint16_t RWIN = 0x5C;
++    constexpr std::uint16_t SHIFT = 0x10;
++    constexpr std::uint16_t CONTROL = 0x11;
 +    constexpr std::uint16_t LSHIFT = 0xA0;
++    constexpr std::uint16_t RSHIFT = 0xA1;
++    constexpr std::uint16_t LCONTROL = 0xA2;
 +    constexpr std::uint16_t RCONTROL = 0xA3;
 +    constexpr std::uint16_t MENU = 0x12;
++    constexpr std::uint16_t KEY_3 = 0x33;
++    constexpr std::uint16_t KEY_4 = 0x34;
++    constexpr std::uint16_t KEY_5 = 0x35;
++    constexpr std::uint16_t KEY_A = 0x41;
++    constexpr std::uint16_t KEY_D = 0x44;
++    constexpr std::uint16_t KEY_T = 0x54;
++    constexpr std::uint16_t KEY_U = 0x55;
++    constexpr std::uint16_t KEY_W = 0x57;
++    constexpr std::uint16_t KEY_Z = 0x5A;
 +    constexpr std::uint16_t LMENU = 0xA4;
 +    constexpr std::uint16_t RMENU = 0xA5;
 +    constexpr std::uint16_t OEM_3 = 0xC0;  ///< ` ~
@@ -571,6 +608,93 @@ index 0000000..83a1749
 +  }
 +
 +  /**
++   * @brief A host shortcut: modifiers plus one key (for example Shift+Super+S).
++   */
++  struct chord_t {
++    bool ctrl = false;
++    bool alt = false;
++    bool super = false;
++    bool shift = false;
++    std::uint16_t key = 0;
++
++    bool operator==(const chord_t &) const = default;
++  };
++
++  /**
++   * @brief Parse a GTK accelerator such as "<Shift><Super>s" or "Print".
++   *
++   * Only what desktop shortcuts use is understood: Ctrl/Alt/Super/Shift and a letter, a digit,
++   * Print or F1-F12.
++   *
++   * @return The chord, or nothing for anything else.
++   */
++  constexpr std::optional<chord_t> parse_accel(std::string_view accel) {
++    chord_t c;
++    auto lower = [](char ch) {
++      return ch >= 'A' && ch <= 'Z' ? static_cast<char>(ch - 'A' + 'a') : ch;
++    };
++    auto iequals = [&](std::string_view a, std::string_view b) {
++      if (a.size() != b.size()) {
++        return false;
++      }
++      for (std::size_t k = 0; k < a.size(); ++k) {
++        if (lower(a[k]) != lower(b[k])) {
++          return false;
++        }
++      }
++      return true;
++    };
++    while (!accel.empty() && accel.front() == '<') {
++      const auto end = accel.find('>');
++      if (end == std::string_view::npos) {
++        return std::nullopt;
++      }
++      const auto mod = accel.substr(1, end - 1);
++      if (iequals(mod, "ctrl") || iequals(mod, "control") || iequals(mod, "primary")) {
++        c.ctrl = true;
++      } else if (iequals(mod, "alt")) {
++        c.alt = true;
++      } else if (iequals(mod, "super")) {
++        c.super = true;
++      } else if (iequals(mod, "shift")) {
++        c.shift = true;
++      } else {
++        return std::nullopt;
++      }
++      accel.remove_prefix(end + 1);
++    }
++    if (accel.size() == 1) {
++      const char ch = lower(accel.front());
++      if (ch >= 'a' && ch <= 'z') {
++        c.key = static_cast<std::uint16_t>('A' + (ch - 'a'));
++      } else if (ch >= '0' && ch <= '9') {
++        c.key = static_cast<std::uint16_t>(ch);
++      } else {
++        return std::nullopt;
++      }
++      return c;
++    }
++    if (iequals(accel, "print")) {
++      c.key = 0x2C;
++      return c;
++    }
++    if (accel.size() >= 2 && lower(accel.front()) == 'f') {
++      int n = 0;
++      for (const char ch : accel.substr(1)) {
++        if (ch < '0' || ch > '9') {
++          return std::nullopt;
++        }
++        n = n * 10 + (ch - '0');
++      }
++      if (n >= 1 && n <= 12) {
++        c.key = static_cast<std::uint16_t>(0x70 + n - 1);
++        return c;
++      }
++    }
++    return std::nullopt;
++  }
++
++  /**
 +   * @brief Stateful Mac → host shortcut translator for one client.
 +   */
 +  class translator_t {
@@ -585,12 +709,19 @@ index 0000000..83a1749
 +     * @return True when the translator handled the key; false means "pass it through as is".
 +     */
 +    bool key(std::uint16_t code, bool release, bool shift_held, events_t &out) {
++      if (is_shift(code)) {
++        // Shift always travels the normal path, which keeps the caller's Shift state exact.
++        if (!release) {
++          lone_cmd = false;
++        }
++        return false;
++      }
 +      if (const auto bit = cmd_bit(code)) {
 +        const bool was_held = cmd != 0;
 +        update(cmd, bit, release);
 +        if (!release && !was_held) {
 +          // Possibly the start of a lone tap, which means Super like the Windows key.
-+          lone_cmd = !opt && held.empty();
++          lone_cmd = !opt && !ctl && held.empty();
 +        } else if (!release) {
 +          lone_cmd = false;  // second Cmd key
 +        }
@@ -607,6 +738,12 @@ index 0000000..83a1749
 +        set_mods(base(), out);
 +        return true;
 +      }
++      if (const auto bit = ctl_bit(code)) {
++        update(ctl, bit, release);
++        lone_cmd = false;
++        set_mods(base(), out);
++        return true;
++      }
 +      if (!release) {
 +        lone_cmd = false;
 +      }
@@ -618,11 +755,15 @@ index 0000000..83a1749
 +        }
 +        out.push_back({it->second, true});
 +        held.erase(it);
++        if (host.shift) {
++          // The extra Shift of a terminal shortcut lasts as long as its key.
++          set_mods({host.ctrl, host.alt, host.super, false}, out);
++        }
 +        return true;
 +      }
 +
 +      if (!cmd && !opt) {
-+        // Plain typing. Host modifiers are already clear here (both releases call set_mods).
++        // Plain typing, or Control + key (the host already holds Ctrl for it).
 +        return false;
 +      }
 +
@@ -630,6 +771,11 @@ index 0000000..83a1749
 +        // A press without a release in between (lost packet): release the old mapping first.
 +        out.push_back({it->second, true});
 +        held.erase(it);
++      }
++
++      if (cmd && ctl) {
++        // Control + Cmd: the PC's own Super shortcuts, untouched.
++        return map(code, code, base(), out);
 +      }
 +
 +      if (cmd) {
@@ -657,7 +803,19 @@ index 0000000..83a1749
 +            set_mods({}, out);
 +            tap(vk::LWIN, out);
 +            return true;
++          case vk::KEY_3:
++          case vk::KEY_4:
++          case vk::KEY_5:
++            if (shift_held) {
++              chord(code == vk::KEY_3 ? shot_full : shot_tool, out);  // Shift is held
++              return true;
++            }
++            break;
 +          case vk::BACK:
++            if (terminal) {
++              // Shells: kill to the line start.
++              return map(code, vk::KEY_U, {true, false, false}, out);
++            }
 +            // Select to the line start, then delete the selection (or the line break when the
 +            // cursor already is at the start, like on a Mac).
 +            set_mods({}, out);
@@ -672,18 +830,31 @@ index 0000000..83a1749
 +            tap(vk::BACK, out);
 +            return true;
 +          default:
-+            return map(code, code, {true, opt != 0, false}, out);
++            break;
 +        }
++        if (terminal && code >= vk::KEY_A && code <= vk::KEY_Z) {
++          // Terminals use Ctrl+Shift for copy, paste, new tab, ...: Ctrl+C must stay "interrupt".
++          return map(code, code, {true, opt != 0, false, !shift_held}, out);
++        }
++        return map(code, code, {true, opt != 0, false}, out);
 +      }
 +
 +      // Option without Cmd
 +      switch (code) {
++        case vk::BACK:
++          if (terminal) {
++            return map(code, vk::KEY_W, {true, false, false}, out);  // shells: delete word
++          }
++          return map(code, code, {true, false, false}, out);
++        case vk::DEL:
++          if (terminal) {
++            return map(code, vk::KEY_D, {false, true, false}, out);  // shells: delete next word
++          }
++          return map(code, code, {true, false, false}, out);
 +        case vk::LEFT:
 +        case vk::RIGHT:
 +        case vk::UP:
 +        case vk::DOWN:
-+        case vk::BACK:
-+        case vk::DEL:
 +          return map(code, code, {true, false, false}, out);
 +        default:
 +          return map(code, code, {false, true, false}, out);
@@ -695,7 +866,7 @@ index 0000000..83a1749
 +     */
 +    void pointer_button(events_t &out) {
 +      lone_cmd = false;
-+      if (cmd || opt) {
++      if (cmd || opt || ctl) {
 +        set_mods(base(), out);
 +      }
 +    }
@@ -708,14 +879,29 @@ index 0000000..83a1749
 +    }
 +
 +    /**
++     * @brief Whether the focused window on the host is a terminal.
++     */
++    void set_terminal(bool focused) {
++      terminal = focused;
++    }
++
++    /**
++     * @brief The host's screenshot shortcuts (full screen, and the interactive tool).
++     */
++    void set_screenshot_shortcuts(chord_t full, chord_t tool) {
++      shot_full = full;
++      shot_tool = tool;
++    }
++
++    /**
 +     * @brief Release everything the translator holds on the host (stream ends or resets).
 +     */
 +    void reset(events_t &out) {
-+      for (const auto &[client, host] : held) {
-+        out.push_back({host, true});
++      for (const auto &[client, host_key] : held) {
++        out.push_back({host_key, true});
 +      }
 +      held.clear();
-+      cmd = opt = 0;
++      cmd = opt = ctl = 0;
 +      lone_cmd = false;
 +      set_mods({}, out);
 +    }
@@ -732,7 +918,12 @@ index 0000000..83a1749
 +      bool ctrl = false;
 +      bool alt = false;
 +      bool super = false;
++      bool shift = false;  ///< Extra Shift (terminal shortcuts); the client's own is not ours.
 +    };
++
++    static bool is_shift(std::uint16_t code) {
++      return code == vk::SHIFT || code == vk::LSHIFT || code == vk::RSHIFT;
++    }
 +
 +    static std::uint8_t cmd_bit(std::uint16_t code) {
 +      return code == vk::LWIN ? 1 : code == vk::RWIN ? 2 : 0;
@@ -742,12 +933,19 @@ index 0000000..83a1749
 +      return code == vk::LMENU || code == vk::MENU ? 1 : code == vk::RMENU ? 2 : 0;
 +    }
 +
++    static std::uint8_t ctl_bit(std::uint16_t code) {
++      return code == vk::LCONTROL || code == vk::CONTROL ? 1 : code == vk::RCONTROL ? 2 : 0;
++    }
++
 +    static void update(std::uint8_t &mask, std::uint8_t bit, bool release) {
 +      mask = release ? (mask & ~bit) : (mask | bit);
 +    }
 +
 +    mods_t base() const {
-+      return {cmd != 0, opt != 0, false};
++      if (cmd && ctl) {
++        return {false, opt != 0, true};
++      }
++      return {cmd != 0 || ctl != 0, opt != 0, false};
 +    }
 +
 +    /**
@@ -763,6 +961,9 @@ index 0000000..83a1749
 +      if (want.super && !host.super) {
 +        out.push_back({vk::LWIN, false});
 +      }
++      if (want.shift && !host.shift) {
++        out.push_back({vk::RSHIFT, false});
++      }
 +      if (!want.ctrl && host.ctrl) {
 +        out.push_back({vk::RCONTROL, true});
 +      }
@@ -771,6 +972,9 @@ index 0000000..83a1749
 +      }
 +      if (!want.super && host.super) {
 +        out.push_back({vk::LWIN, true});
++      }
++      if (!want.shift && host.shift) {
++        out.push_back({vk::RSHIFT, true});
 +      }
 +      host = want;
 +    }
@@ -803,9 +1007,33 @@ index 0000000..83a1749
 +      out.push_back({code, true});
 +    }
 +
++    /**
++     * @brief Press a host shortcut once, while the client holds Shift (Cmd+Shift+3).
++     *
++     * A shortcut without Shift (GNOME's default "Print") lets go of the host's Shift first: the
++     * client's later Shift release then finds it already up, which is harmless, whereas
++     * pressing it again could leave the other Shift key stuck.
++     */
++    void chord(chord_t c, events_t &out) {
++      if (!c.key) {
++        return;
++      }
++      set_mods({c.ctrl, c.alt, c.super, false}, out);
++      if (!c.shift) {
++        out.push_back({vk::LSHIFT, true});
++        out.push_back({vk::RSHIFT, true});
++      }
++      tap(c.key, out);
++      set_mods(base(), out);
++    }
++
 +    std::uint8_t cmd = 0;  ///< Client Cmd keys held (bit 0 left, bit 1 right).
 +    std::uint8_t opt = 0;  ///< Client Option keys held.
++    std::uint8_t ctl = 0;  ///< Client Control keys held.
 +    bool lone_cmd = false;  ///< Cmd is down and nothing else happened yet.
++    bool terminal = false;  ///< A terminal has focus on the host.
++    chord_t shot_full {false, false, false, true, 0x2C};  ///< GNOME default: Shift+Print.
++    chord_t shot_tool {false, false, false, false, 0x2C};  ///< GNOME default: Print.
 +    mods_t host;  ///< Modifiers the translator currently holds on the host.
 +    std::unordered_map<std::uint16_t, std::uint16_t> held;  ///< Client key → host key it pressed.
 +  };
@@ -1120,10 +1348,10 @@ index 9e2d2a7..d8f00ac 100644
        sources[source::PORTAL] = true;
 diff --git a/src/platform/linux/mutter_rd.cpp b/src/platform/linux/mutter_rd.cpp
 new file mode 100644
-index 0000000..62260c9
+index 0000000..dc75adc
 --- /dev/null
 +++ b/src/platform/linux/mutter_rd.cpp
-@@ -0,0 +1,607 @@
+@@ -0,0 +1,714 @@
 +/**
 + * @file src/platform/linux/mutter_rd.cpp
 + * @brief GNOME (Mutter) remote desktop session: clipboard sharing and touchpad-style scrolling.
@@ -1139,6 +1367,7 @@ index 0000000..62260c9
 + */
 +// standard includes
 +#include <algorithm>
++#include <cctype>
 +#include <atomic>
 +#include <cerrno>
 +#include <chrono>
@@ -1156,6 +1385,9 @@ index 0000000..62260c9
 +#include <gio/gunixfdlist.h>
 +#include <poll.h>
 +#include <unistd.h>
++
++// lib includes
++#include <nlohmann/json.hpp>
 +
 +// local includes
 +#include "mutter_rd.h"
@@ -1182,6 +1414,37 @@ index 0000000..62260c9
 +    constexpr const char *TEXT_OFFERS[] = {"text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING", "TEXT"};
 +    /// Best text format first when reading from the PC.
 +    constexpr const char *TEXT_READ_ORDER[] = {"text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING", "TEXT"};
++
++    constexpr const char *SHELL_BUS = "org.gnome.Shell";
++    /// Lightpath's GNOME Shell helper, then Couch Helper: both announce focus changes.
++    constexpr const char *LIGHTPATH_HELPER_PATH = "/org/lightpath/Helper";
++    constexpr const char *LIGHTPATH_HELPER_IFACE = "org.lightpath.Helper";
++    constexpr const char *COUCH_HELPER_PATH = "/local/couch/Helper";
++    constexpr const char *COUCH_HELPER_IFACE = "local.couch.Helper";
++
++    /**
++     * @return Whether a window class belongs to a terminal emulator.
++     */
++    bool is_terminal_class(std::string cls) {
++      std::ranges::transform(cls, cls.begin(), [](unsigned char c) {
++        return static_cast<char>(std::tolower(c));
++      });
++      static constexpr std::string_view TERMINALS[] = {"konsole", "alacritty", "org.gnome.console", "kgx", "terminal", "ptyxis", "kitty", "ghostty", "foot", "wezterm", "xterm", "tilix", "terminator", "rio", "contour", "blackbox"};
++      return std::ranges::any_of(TERMINALS, [&cls](std::string_view t) {
++        return cls.find(t) != std::string::npos;
++      });
++    }
++
++    /**
++     * @return Whether a helper's window description (JSON with "wm_class") is a terminal.
++     */
++    bool describes_terminal(std::string_view json) {
++      const auto j = nlohmann::json::parse(json, nullptr, false);
++      if (!j.is_object()) {
++        return false;
++      }
++      return is_terminal_class(j.value("wm_class", std::string {})) || is_terminal_class(j.value("wm_instance", std::string {}));
++    }
 +
 +    bool is_text_mime(std::string_view mime) {
 +      return mime.starts_with("text/plain") || mime == "UTF8_STRING" || mime == "STRING" || mime == "TEXT";
@@ -1262,6 +1525,7 @@ index 0000000..62260c9
 +          return;
 +        }
 +        invoke([this]() {
++          watch_focus();
 +          ++users;
 +          if (linger_source) {
 +            g_source_destroy(linger_source);
@@ -1416,6 +1680,10 @@ index 0000000..62260c9
 +        return !session_path().empty();
 +      }
 +
++      bool terminal_focused() const {
++        return terminal;
++      }
++
 +    private:
 +      service_t() = default;
 +
@@ -1548,6 +1816,48 @@ index 0000000..62260c9
 +        pc_mimes.clear();
 +        session_owns = false;
 +        own_data.reset();
++      }
++
++      // ---- focused window (main loop thread) -------------------------------------------------
++
++      void watch_focus() {
++        if (!focus_subscription) {
++          focus_subscription = g_dbus_connection_signal_subscribe(conn, nullptr, nullptr, "FocusChanged", nullptr, nullptr, G_DBUS_SIGNAL_FLAGS_NONE, [](GDBusConnection *, const gchar *, const gchar *, const gchar *iface, const gchar *, GVariant *params, gpointer self) {
++            const std::string_view i {iface ? iface : ""};
++            if ((i == LIGHTPATH_HELPER_IFACE || i == COUCH_HELPER_IFACE) && g_variant_is_of_type(params, G_VARIANT_TYPE("(s)"))) {
++              const gchar *json = nullptr;
++              g_variant_get(params, "(&s)", &json);
++              static_cast<service_t *>(self)->terminal = describes_terminal(json);
++            }
++          },
++                                                                  this,
++                                                                  nullptr);
++        }
++        // Where focus is right now (a stream starts while a window already has focus).
++        g_autoptr(GVariant) r = g_dbus_connection_call_sync(conn, SHELL_BUS, LIGHTPATH_HELPER_PATH, LIGHTPATH_HELPER_IFACE, "Focused", nullptr, G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE, 500, nullptr, nullptr);
++        if (r) {
++          const gchar *json = nullptr;
++          g_variant_get(r, "(&s)", &json);
++          terminal = describes_terminal(json);
++          return;
++        }
++        g_autoptr(GVariant) list = g_dbus_connection_call_sync(conn, SHELL_BUS, COUCH_HELPER_PATH, COUCH_HELPER_IFACE, "ListWindows", nullptr, G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE, 500, nullptr, nullptr);
++        if (!list) {
++          return;
++        }
++        const gchar *json = nullptr;
++        g_variant_get(list, "(&s)", &json);
++        const auto windows = nlohmann::json::parse(json, nullptr, false);
++        bool found = false;
++        if (windows.is_array()) {
++          for (const auto &w : windows) {
++            if (w.is_object() && w.value("focused", false)) {
++              found = describes_terminal(w.dump());
++              break;
++            }
++          }
++        }
++        terminal = found;
 +      }
 +
 +      void reset_baseline() {
@@ -1690,10 +2000,12 @@ index 0000000..62260c9
 +      int users = 0;
 +      GSource *linger_source = nullptr;
 +      guint subscription = 0;
++      guint focus_subscription = 0;
 +
 +      // Any thread.
 +      std::atomic<gint64> last_scroll_us {0};
 +      std::atomic_bool finish_pending {false};
++      std::atomic_bool terminal {false};  ///< The focused window is a terminal.
 +      std::mutex read_lock;
 +
 +      std::mutex lock;  ///< Guards everything below.
@@ -1730,13 +2042,36 @@ index 0000000..62260c9
 +  bool available() {
 +    return service_t::instance().available();
 +  }
++
++  bool terminal_focused() {
++    return service_t::instance().terminal_focused();
++  }
++
++  std::string desktop_shortcut(const char *schema, const char *key) {
++    GSettingsSchemaSource *source = g_settings_schema_source_get_default();
++    if (!source) {
++      return {};
++    }
++    g_autoptr(GSettingsSchema) found = g_settings_schema_source_lookup(source, schema, TRUE);
++    if (!found || !g_settings_schema_has_key(found, key)) {
++      return {};
++    }
++    g_autoptr(GSettings) settings = g_settings_new_full(found, nullptr, nullptr);
++    g_auto(GStrv) accels = g_settings_get_strv(settings, key);
++    for (gchar **a = accels; a && *a; ++a) {
++      if (**a) {
++        return *a;
++      }
++    }
++    return {};
++  }
 +}  // namespace mutter_rd
 diff --git a/src/platform/linux/mutter_rd.h b/src/platform/linux/mutter_rd.h
 new file mode 100644
-index 0000000..e51e66b
+index 0000000..e08ceb8
 --- /dev/null
 +++ b/src/platform/linux/mutter_rd.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,124 @@
 +/**
 + * @file src/platform/linux/mutter_rd.h
 + * @brief GNOME (Mutter) remote desktop session: clipboard sharing and touchpad-style scrolling.
@@ -1811,6 +2146,21 @@ index 0000000..e51e66b
 +  bool clipboard_set(const std::string &mime, std::string data);
 +
 +  /**
++   * @return Whether the focused window is a terminal (Konsole, GNOME Console, Alacritty, ...).
++   *
++   * Known from a GNOME Shell helper extension (Lightpath's, or Couch Helper) that announces
++   * focus changes; false when no helper is running.
++   */
++  bool terminal_focused();
++
++  /**
++   * @brief First accelerator of a GSettings key holding a list of shortcuts.
++   *
++   * @return For example "<Shift>Print"; empty when the schema or key does not exist.
++   */
++  std::string desktop_shortcut(const char *schema, const char *key);
++
++  /**
 +   * @return Whether a remote desktop session is currently running.
 +   */
 +  bool available();
@@ -1835,6 +2185,14 @@ index 0000000..e51e66b
 +
 +  inline bool available() {
 +    return false;
++  }
++
++  inline bool terminal_focused() {
++    return false;
++  }
++
++  inline std::string desktop_shortcut(const char *, const char *) {
++    return {};
 +  }
 +#endif
 +}  // namespace mutter_rd
@@ -3247,10 +3605,10 @@ index b914ed1..5a87280 100644
      "nvenc_realtime_hags_desc": "Currently NVIDIA drivers may freeze in encoder when HAGS is enabled, realtime priority is used and VRAM utilization is close to maximum. Disabling this option lowers the priority to high, sidestepping the freeze at the cost of reduced capture performance when the GPU is heavily loaded.",
 diff --git a/tests/unit/test_mac_keymap.cpp b/tests/unit/test_mac_keymap.cpp
 new file mode 100644
-index 0000000..ddc3efc
+index 0000000..680ef29
 --- /dev/null
 +++ b/tests/unit/test_mac_keymap.cpp
-@@ -0,0 +1,550 @@
+@@ -0,0 +1,679 @@
 +/**
 + * @file tests/unit/test_mac_keymap.cpp
 + * @brief Tests for the macOS shortcut translator in src/mac_keymap.h.
@@ -3494,6 +3852,109 @@ index 0000000..ddc3efc
 +  }
 +}
 +
++TEST(MacKeymapTest, ControlCmdKeyIsSuperKey) {
++  harness_t h;
++  h.press(vk::LCONTROL);
++  h.press(vk::LWIN);
++  h.press(vk::LEFT);  // Super+Left tiles, not Home
++  h.release(vk::LEFT);
++  h.release(vk::LWIN);
++  h.release(vk::LCONTROL);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::LWIN), up(vk::RCONTROL), down(vk::LEFT), up(vk::LEFT), down(vk::RCONTROL), up(vk::LWIN), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, CmdBeforeControlAlsoGivesSuper) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.press(vk::RCONTROL);
++  h.press(KEY_A);
++  h.release(KEY_A);
++  h.release(vk::RCONTROL);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::LWIN), up(vk::RCONTROL), down(KEY_A), up(KEY_A), down(vk::RCONTROL), up(vk::LWIN), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, ControlAloneIsCtrlForTerminals) {
++  harness_t h;
++  h.t.set_terminal(true);
++  h.press(vk::LCONTROL);
++  EXPECT_FALSE(h.press(KEY_C));  // typed as is while the host holds Ctrl: interrupt
++  EXPECT_FALSE(h.release(KEY_C));
++  h.release(vk::LCONTROL);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, CmdCopyPasteInATerminalUsesCtrlShift) {
++  harness_t h;
++  h.t.set_terminal(true);
++  h.press(vk::LWIN);
++  h.press(KEY_C);
++  h.release(KEY_C);
++  h.press(KEY_V);
++  h.release(KEY_V);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::RSHIFT), down(KEY_C), up(KEY_C), up(vk::RSHIFT), down(vk::RSHIFT), down(KEY_V), up(KEY_V), up(vk::RSHIFT), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, CmdShiftLetterInATerminalAddsNoSecondShift) {
++  harness_t h;
++  h.t.set_terminal(true);
++  h.shift = true;
++  h.press(vk::LWIN);
++  h.press(vk::KEY_T);
++  h.release(vk::KEY_T);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::KEY_T), up(vk::KEY_T), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, TerminalLineAndWordDeletion) {
++  harness_t h;
++  h.t.set_terminal(true);
++  h.press(vk::LWIN);
++  h.press(vk::BACK);
++  h.release(vk::BACK);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), down(vk::KEY_U), up(vk::KEY_U), up(vk::RCONTROL)}));
++  h.press(vk::LMENU);
++  h.press(vk::BACK);
++  h.release(vk::BACK);
++  h.release(vk::LMENU);
++  EXPECT_EQ(h.take(), (events_t {down(vk::LMENU), down(vk::RCONTROL), up(vk::LMENU), down(vk::KEY_W), up(vk::KEY_W), up(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, ScreenshotsUseThePcShortcuts) {
++  harness_t h;
++  h.t.set_screenshot_shortcuts(*parse_accel("<Shift>Print"), *parse_accel("<Shift><Super>s"));
++  h.shift = true;
++  h.press(vk::LWIN);
++  h.press(vk::KEY_3);
++  h.release(vk::KEY_3);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(0x2C), up(0x2C), down(vk::RCONTROL)}));
++  h.press(vk::KEY_4);
++  h.release(vk::KEY_4);
++  EXPECT_EQ(h.take(), (events_t {down(vk::LWIN), up(vk::RCONTROL), down(0x53), up(0x53), down(vk::RCONTROL), up(vk::LWIN)}));
++}
++
++TEST(MacKeymapTest, ScreenshotToolWithoutShiftLetsGoOfShift) {
++  harness_t h;  // GNOME defaults: Print opens the tool
++  h.shift = true;
++  h.press(vk::LWIN);
++  h.press(vk::KEY_5);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), up(vk::LSHIFT), up(vk::RSHIFT), down(0x2C), up(0x2C), down(vk::RCONTROL)}));
++}
++
++TEST(MacKeymapTest, ParsesDesktopAccelerators) {
++  EXPECT_EQ(parse_accel("<Shift><Super>s"), (chord_t {false, false, true, true, 0x53}));
++  EXPECT_EQ(parse_accel("<Control><Alt>T"), (chord_t {true, true, false, false, 0x54}));
++  EXPECT_EQ(parse_accel("Print"), (chord_t {false, false, false, false, 0x2C}));
++  EXPECT_EQ(parse_accel("<Super>F12"), (chord_t {false, false, true, false, 0x7B}));
++  EXPECT_EQ(parse_accel("<Super>1"), (chord_t {false, false, true, false, 0x31}));
++  EXPECT_FALSE(parse_accel("<Hyper>a"));
++  EXPECT_FALSE(parse_accel("XF86Display"));
++  EXPECT_FALSE(parse_accel("<Super"));
++  EXPECT_FALSE(parse_accel(""));
++}
++
 +TEST(MacKeymapTest, CmdHAndCmdMHideTheWindow) {
 +  harness_t h;
 +  h.press(vk::LWIN);
@@ -3605,17 +4066,21 @@ index 0000000..ddc3efc
 + * @brief Random client key storms never leave a host key stuck or released twice.
 + */
 +TEST(MacKeymapTest, RandomSequencesNeverStickOrDoubleRelease) {
-+  const std::vector<std::uint16_t> keys {vk::LWIN, vk::RWIN, vk::LMENU, vk::RMENU, KEY_A, KEY_C, KEY_V, vk::TAB, vk::OEM_3, vk::LEFT, vk::RIGHT, vk::UP, vk::DOWN, vk::BACK, vk::DEL, vk::SPACE, vk::KEY_H, vk::KEY_M, vk::OEM_4, vk::OEM_6};
++  const std::vector<std::uint16_t> keys {vk::LWIN, vk::RWIN, vk::LMENU, vk::RMENU, vk::LCONTROL, vk::RCONTROL, vk::KEY_3, vk::KEY_4, vk::KEY_U, KEY_A, KEY_C, KEY_V, vk::TAB, vk::OEM_3, vk::LEFT, vk::RIGHT, vk::UP, vk::DOWN, vk::BACK, vk::DEL, vk::SPACE, vk::KEY_H, vk::KEY_M, vk::OEM_4, vk::OEM_6};
 +  std::mt19937 rng {1234};
 +
 +  for (int round = 0; round < 2000; ++round) {
 +    translator_t t;
++    t.set_terminal(rng() % 2);
 +    std::set<std::uint16_t> client_down;
 +    std::map<std::uint16_t, int> host_down;  // what the translator pressed on the host
 +    bool shift = rng() % 2;
 +
 +    auto apply = [&](const events_t &out) {
 +      for (const auto &e : out) {
++        if (e.release && (e.vk == vk::LSHIFT || e.vk == vk::RSHIFT) && host_down[e.vk] == 0) {
++          continue;  // letting go of the client's own Shift for a screenshot shortcut
++        }
 +        if (e.release) {
 +          ASSERT_EQ(host_down[e.vk], 1) << "released a host key that was not down: " << e.vk;
 +          host_down[e.vk] = 0;
@@ -3780,14 +4245,36 @@ index 0000000..ddc3efc
 +  EXPECT_EQ(taken(), (std::vector<std::string> {"+0x41", "-0x41"}));
 +}
 +
-+TEST_F(MacKeyboardPassthroughTest, MacCtrlAndShiftStillPassThrough) {
++TEST_F(MacKeyboardPassthroughTest, MacCtrlStillWorksAsCtrl) {
 +  input::set_mac_client(stream_, true);
 +  taken();
 +  press(0xA2, MODIFIER_CTRL);  // Mac Ctrl (e.g. Ctrl+C in a terminal)
 +  press(KEY_C, MODIFIER_CTRL);
 +  release(KEY_C, MODIFIER_CTRL);
 +  release(0xA2);
-+  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA2", "+0x43", "-0x43", "-0xA2"}));
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA3", "+0x43", "-0x43", "-0xA3"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, MacShiftPassesThrough) {
++  input::set_mac_client(stream_, true);
++  taken();
++  press(vk::LSHIFT, MODIFIER_SHIFT);
++  press(KEY_A, MODIFIER_SHIFT);
++  release(KEY_A, MODIFIER_SHIFT);
++  release(vk::LSHIFT);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA0", "+0x41", "-0x41", "-0xA0"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, ControlCmdReachesTheSuperShortcuts) {
++  input::set_mac_client(stream_, true);
++  taken();
++  press(0xA2, MODIFIER_CTRL);
++  press(vk::LWIN, MODIFIER_CTRL | MODIFIER_META);
++  press(vk::KEY_T, MODIFIER_CTRL | MODIFIER_META);
++  release(vk::KEY_T, MODIFIER_CTRL | MODIFIER_META);
++  release(vk::LWIN, MODIFIER_CTRL);
++  release(0xA2);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA3", "+0x5B", "-0xA3", "+0x54", "-0x54", "+0xA3", "-0x5B", "-0xA3"}));
 +}
 +
 +TEST_F(MacKeyboardPassthroughTest, ResumingResetsTranslatorState) {
