@@ -1,0 +1,15 @@
+[Unit]
+Description=Lightpath login-screen streaming (Sunshine on the GDM login screen)
+After=gdm.service network-online.target
+# Started and stopped by lightpath-greeter-watch.service.
+
+[Service]
+Type=simple
+Environment=HOME=/var/lib/lightpath-greeter
+StateDirectory=lightpath-greeter
+StateDirectoryMode=0700
+# Same identity and paired devices as the desktop Sunshine.
+ExecStartPre=/usr/local/libexec/lightpath/greeter-sync
+ExecStart=/usr/bin/sunshine /etc/lightpath/greeter/sunshine.conf
+Restart=on-failure
+RestartSec=2s

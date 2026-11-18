@@ -192,6 +192,7 @@ cmd_connect() {
 
     r="$(wake_and_wait)" || die "Couldn't reach the PC. Is it on and is Tailscale connected on this Mac?"
     kind="${r%% *}"; addr="${r#* }"
+    refresh_host >/dev/null 2>&1 || true  # fresh facts (login screen or desktop) after a wake
     size="$(screen_size)"
 
     if [ "$kind" = "lan" ]; then
@@ -229,6 +230,31 @@ cmd_connect() {
         --resolution "$size" --fps "$FPS" --bitrate "$kbps" --video-codec "$codec" \
         --display-mode borderless --no-vsync --no-frame-pacing --game-optimization \
         --no-quit-after --keep-awake --capture-system-keys fullscreen "$mouse"
+    if [ "$(json "$HOSTJSON" screen)" = login ]; then
+        say "The PC is at its login screen: type your password, and the desktop opens by itself."
+        follow_login "$app" </dev/null >/dev/null 2>&1 &
+    fi
+}
+
+follow_login() { # the PC was at its login screen: once the password is typed, follow to the desktop
+    local app="$1" start gone=0
+    start=$(date +%s)
+    sleep 5
+    while [ $(( $(date +%s) - start )) -lt 3600 ]; do
+        if refresh_host >/dev/null 2>&1 && [ "$(json "$HOSTJSON" screen)" = desktop ]; then
+            logf "logged in at the PC: reconnecting to the desktop"
+            notify "Logged in. Connecting to your desktop…"
+            exec "$0" connect "$app"
+        fi
+        if pgrep -x Moonlight >/dev/null; then
+            gone=0
+        else
+            # Closed the stream yourself (or Moonlight quit when the login screen went away):
+            # keep looking a little longer for the desktop, then give up.
+            gone=$((gone + 1)); [ "$gone" -gt 15 ] && return 0
+        fi
+        sleep 2
+    done
 }
 
 cmd_wake() {

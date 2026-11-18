@@ -1,0 +1,9 @@
+#!/bin/bash
+# Copy the desktop Sunshine's identity and paired devices for the login-screen Sunshine.
+set -e
+user="$(cat /etc/lightpath/greeter/user)"
+src="$(getent passwd "$user" | cut -d: -f6)/.config/sunshine"
+dst=/var/lib/lightpath-greeter
+install -d -m 700 "$dst/credentials"
+install -m 600 "$src/sunshine_state.json" "$dst/sunshine_state.json"
+install -m 600 "$src/credentials/cacert.pem" "$src/credentials/cakey.pem" "$dst/credentials/"

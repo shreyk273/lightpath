@@ -1,4 +1,4 @@
-From 97006f6a7d28ccb99631d294eea186d4138b70c2 Mon Sep 17 00:00:00 2001
+From f6b923acb8ffeb28e7673519847049f9682376ba Mon Sep 17 00:00:00 2001
 From: Shreyansh Kaushik <smkaushi@ucsc.edu>
 Date: Tue, 17 Nov 2026 00:23:24 -0800
 Subject: [PATCH] Lightpath: GNOME virtual display capture, Linux NVENC
@@ -19,9 +19,9 @@ Claude-Session: https://claude.ai/code/session_01JSGYnegbZ8CEyDK2p2YTH2
  docs/configuration.md                         | 108 +-
  src/config.cpp                                |  14 +
  src/config.h                                  |   6 +
- src/input.cpp                                 |  79 ++
+ src/input.cpp                                 |  81 ++
  src/input.h                                   |  11 +
- src/mac_keymap.h                              | 315 ++++++
+ src/mac_keymap.h                              | 341 +++++++
  src/nvhttp.cpp                                | 120 ++-
  src/platform/common.h                         |   9 +
  src/platform/linux/misc.cpp                   |  40 +-
@@ -37,9 +37,9 @@ Claude-Session: https://claude.ai/code/session_01JSGYnegbZ8CEyDK2p2YTH2
  .../common/assets/web/configs/tabs/Inputs.vue |  16 +
  .../tabs/encoders/NvidiaNvencEncoder.vue      |  23 +-
  .../assets/web/public/assets/locale/en.json   |   9 +
- tests/unit/test_mac_keymap.cpp                | 497 ++++++++++
+ tests/unit/test_mac_keymap.cpp                | 550 +++++++++++
  tests/unit/test_video.cpp                     |  20 +-
- 25 files changed, 3080 insertions(+), 27 deletions(-)
+ 25 files changed, 3161 insertions(+), 27 deletions(-)
  create mode 100644 src/mac_keymap.h
  create mode 100644 src/platform/linux/mutter_rd.cpp
  create mode 100644 src/platform/linux/mutter_rd.h
@@ -284,7 +284,7 @@ index dc890e2..14ba19f 100644
  
    namespace flag {
 diff --git a/src/input.cpp b/src/input.cpp
-index a6afa54..eb4cbe8 100644
+index a6afa54..b161cca 100644
 --- a/src/input.cpp
 +++ b/src/input.cpp
 @@ -33,7 +33,11 @@ extern "C" {
@@ -378,10 +378,12 @@ index a6afa54..eb4cbe8 100644
      update_modifier_state(*input, keyCode, release);
  
      // Right-alt maps to meta, so it must not also register as ALT
-@@ -1310,6 +1356,16 @@ namespace input {
+@@ -1309,6 +1355,17 @@ namespace input {
+     if (!config::input.mouse) {
        return;
      }
- 
++    input->mac_keys.pointer_used();  // Cmd + scroll is not a lone Cmd tap
++
 +#ifdef __linux__
 +    // Mac clients send scroll distances in points (MAC_SCROLL_UNITS_PER_POINT units each).
 +    // Injected as finger scrolling they move content 1:1 with the trackpad. With Ctrl held
@@ -391,25 +393,25 @@ index a6afa54..eb4cbe8 100644
 +      return;
 +    }
 +#endif
-+
+ 
      if (config::input.high_resolution_scrolling) {
        platf::scroll(platf_input, util::endian::big(packet->scrollAmt1));
-     } else {
-@@ -1333,6 +1389,13 @@ namespace input {
+@@ -1332,6 +1389,14 @@ namespace input {
+     if (!config::input.mouse) {
        return;
      }
- 
++    input->mac_keys.pointer_used();  // Cmd + scroll is not a lone Cmd tap
++
 +#ifdef __linux__
 +    if (input->mac_client && !input->control_keys.any_pressed() &&
 +        mutter_rd::scroll(util::endian::big(packet->scrollAmount) / MAC_SCROLL_UNITS_PER_POINT, 0.0)) {
 +      return;
 +    }
 +#endif
-+
+ 
      if (config::input.high_resolution_scrolling) {
        platf::hscroll(platf_input, util::endian::big(packet->scrollAmount));
-     } else {
-@@ -2371,6 +2434,9 @@ namespace input {
+@@ -2371,6 +2436,9 @@ namespace input {
     * @param input Retained stream input state to reset.
     */
    void reset_input_state(const std::shared_ptr<input_t> &input) {
@@ -419,7 +421,7 @@ index a6afa54..eb4cbe8 100644
      reset_mouse_buttons();
      reset_keyboard_keys();
      reset_gamepads(input);
-@@ -2512,6 +2578,19 @@ namespace input {
+@@ -2512,6 +2580,19 @@ namespace input {
      return input;
    }
  
@@ -463,10 +465,10 @@ index 41e0439..d63eb64 100644
      /**
 diff --git a/src/mac_keymap.h b/src/mac_keymap.h
 new file mode 100644
-index 0000000..1eb2729
+index 0000000..83a1749
 --- /dev/null
 +++ b/src/mac_keymap.h
-@@ -0,0 +1,315 @@
+@@ -0,0 +1,341 @@
 +/**
 + * @file src/mac_keymap.h
 + * @brief macOS keyboard semantics for Mac clients streaming a Linux/Windows desktop.
@@ -483,6 +485,7 @@ index 0000000..1eb2729
 + * | Cmd + Left / Right       | Home / End                    |
 + * | Cmd + Up / Down          | Ctrl + Home / Ctrl + End      |
 + * | Cmd + Backspace          | delete to line start          |
++ * | Cmd tapped alone         | Super (Activities overview)   |
 + * | Cmd + Space              | Super (search)                |
 + * | Cmd + H / Cmd + M        | Super + H (hide window)       |
 + * | Cmd + [ / Cmd + ]        | Alt + Left / Alt + Right      |
@@ -583,14 +586,29 @@ index 0000000..1eb2729
 +     */
 +    bool key(std::uint16_t code, bool release, bool shift_held, events_t &out) {
 +      if (const auto bit = cmd_bit(code)) {
++        const bool was_held = cmd != 0;
 +        update(cmd, bit, release);
++        if (!release && !was_held) {
++          // Possibly the start of a lone tap, which means Super like the Windows key.
++          lone_cmd = !opt && held.empty();
++        } else if (!release) {
++          lone_cmd = false;  // second Cmd key
++        }
 +        set_mods(base(), out);
++        if (release && !cmd && lone_cmd) {
++          lone_cmd = false;
++          tap(vk::LWIN, out);
++        }
 +        return true;
 +      }
 +      if (const auto bit = opt_bit(code)) {
 +        update(opt, bit, release);
++        lone_cmd = false;
 +        set_mods(base(), out);
 +        return true;
++      }
++      if (!release) {
++        lone_cmd = false;
 +      }
 +
 +      if (release) {
@@ -676,9 +694,17 @@ index 0000000..1eb2729
 +     * @brief A mouse button is about to be pressed: Cmd+click must arrive as Ctrl+click.
 +     */
 +    void pointer_button(events_t &out) {
++      lone_cmd = false;
 +      if (cmd || opt) {
 +        set_mods(base(), out);
 +      }
++    }
++
++    /**
++     * @brief The client scrolled or zoomed: a Cmd held meanwhile is not a lone tap.
++     */
++    void pointer_used() {
++      lone_cmd = false;
 +    }
 +
 +    /**
@@ -690,6 +716,7 @@ index 0000000..1eb2729
 +      }
 +      held.clear();
 +      cmd = opt = 0;
++      lone_cmd = false;
 +      set_mods({}, out);
 +    }
 +
@@ -778,6 +805,7 @@ index 0000000..1eb2729
 +
 +    std::uint8_t cmd = 0;  ///< Client Cmd keys held (bit 0 left, bit 1 right).
 +    std::uint8_t opt = 0;  ///< Client Option keys held.
++    bool lone_cmd = false;  ///< Cmd is down and nothing else happened yet.
 +    mods_t host;  ///< Modifiers the translator currently holds on the host.
 +    std::unordered_map<std::uint16_t, std::uint16_t> held;  ///< Client key → host key it pressed.
 +  };
@@ -3219,10 +3247,10 @@ index b914ed1..5a87280 100644
      "nvenc_realtime_hags_desc": "Currently NVIDIA drivers may freeze in encoder when HAGS is enabled, realtime priority is used and VRAM utilization is close to maximum. Disabling this option lowers the priority to high, sidestepping the freeze at the cost of reduced capture performance when the GPU is heavily loaded.",
 diff --git a/tests/unit/test_mac_keymap.cpp b/tests/unit/test_mac_keymap.cpp
 new file mode 100644
-index 0000000..a929969
+index 0000000..ddc3efc
 --- /dev/null
 +++ b/tests/unit/test_mac_keymap.cpp
-@@ -0,0 +1,497 @@
+@@ -0,0 +1,550 @@
 +/**
 + * @file tests/unit/test_mac_keymap.cpp
 + * @brief Tests for the macOS shortcut translator in src/mac_keymap.h.
@@ -3239,6 +3267,7 @@ index 0000000..a929969
 +#endif
 +
 +// standard includes
++#include <functional>
 +#include <map>
 +#include <random>
 +#include <set>
@@ -3423,6 +3452,48 @@ index 0000000..a929969
 +  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(vk::LWIN), up(vk::LWIN)}));
 +}
 +
++TEST(MacKeymapTest, CmdTappedAloneIsSuper) {
++  harness_t h;
++  h.press(vk::LWIN);
++  h.release(vk::LWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(vk::LWIN), up(vk::LWIN)}));
++  h.press(vk::RWIN);  // the right Cmd key too
++  h.release(vk::RWIN);
++  EXPECT_EQ(h.take(), (events_t {down(vk::RCONTROL), up(vk::RCONTROL), down(vk::LWIN), up(vk::LWIN)}));
++}
++
++TEST(MacKeymapTest, CmdUsedForAnythingElseIsNotSuper) {
++  const std::vector<std::function<void(harness_t &)>> uses {
++    [](harness_t &h) { h.press(KEY_C); h.release(KEY_C); },
++    [](harness_t &h) { h.press(vk::LSHIFT); },
++    [](harness_t &h) { h.press(vk::LMENU); h.release(vk::LMENU); },
++    [](harness_t &h) { h.press(vk::RWIN); h.release(vk::RWIN); },
++    [](harness_t &h) { h.t.pointer_button(h.host); },
++    [](harness_t &h) { h.t.pointer_used(); },
++  };
++  for (std::size_t i = 0; i < uses.size(); ++i) {
++    harness_t h;
++    h.press(vk::LWIN);
++    uses[i](h);
++    h.release(vk::LWIN);
++    for (const auto &e : h.take()) {
++      EXPECT_NE(e.vk, vk::LWIN) << "use #" << i << " still produced Super";
++    }
++  }
++}
++
++TEST(MacKeymapTest, CmdPressedWhileAKeyIsHeldIsNotSuper) {
++  harness_t h;
++  h.press(vk::LMENU);
++  h.press(vk::LEFT);  // held as Ctrl+Left
++  h.release(vk::LMENU);
++  h.press(vk::LWIN);
++  h.release(vk::LWIN);
++  for (const auto &e : h.take()) {
++    EXPECT_NE(e.vk, vk::LWIN);
++  }
++}
++
 +TEST(MacKeymapTest, CmdHAndCmdMHideTheWindow) {
 +  harness_t h;
 +  h.press(vk::LWIN);
@@ -3559,7 +3630,9 @@ index 0000000..a929969
 +      const auto code = keys[rng() % keys.size()];
 +      const bool release = client_down.contains(code) ? (rng() % 3 != 0) : false;  // sometimes a lost release
 +      events_t out;
-+      if (rng() % 17 == 0) {
++      if (rng() % 31 == 0) {
++        t.pointer_used();
++      } else if (rng() % 17 == 0) {
 +        t.pointer_button(out);
 +      } else {
 +        t.key(code, release, shift, out);
@@ -3658,6 +3731,14 @@ index 0000000..a929969
 +  release(KEY_C, MODIFIER_META);
 +  release(vk::LWIN);
 +  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA3", "+0x43", "-0x43", "-0xA3"}));
++}
++
++TEST_F(MacKeyboardPassthroughTest, MacClientLoneCmdTapIsSuper) {
++  input::set_mac_client(stream_, true);
++  taken();
++  press(vk::LWIN, MODIFIER_META);
++  release(vk::LWIN);
++  EXPECT_EQ(taken(), (std::vector<std::string> {"+0xA3", "-0xA3", "+0x5B", "-0x5B"}));
 +}
 +
 +TEST_F(MacKeyboardPassthroughTest, OtherClientsKeepTheirWindowsKey) {

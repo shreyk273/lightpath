@@ -1,0 +1,11 @@
+[Unit]
+Description=Lightpath: stream the login screen while nobody is logged in
+After=systemd-logind.service gdm.service
+
+[Service]
+ExecStart=/usr/local/libexec/lightpath/lightpath-greeter-watch
+Restart=always
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

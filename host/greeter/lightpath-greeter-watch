@@ -1,0 +1,51 @@
+#!/usr/bin/python3 -u
+"""Lightpath: stream the login screen.
+
+While seat0 shows the GDM login screen (nobody logged in), run the login-screen Sunshine
+(lightpath-greeter.service). As soon as a user desktop takes over, stop it so the desktop
+Sunshine (a user service tied to the desktop session) gets the ports back.
+"""
+import subprocess
+import time
+
+UNIT = "lightpath-greeter.service"
+WAKE = "/usr/local/libexec/lightpath/greeter-wake"
+
+
+def prop(kind, name, key):
+    r = subprocess.run(["loginctl", f"show-{kind}", name, "-p", key, "--value"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def at_login_screen():
+    active = prop("seat", "seat0", "ActiveSession")
+    if not active:
+        return True  # between sessions (the login screen is starting)
+    return prop("session", active, "Class") != "user"
+
+
+def unit_active():
+    return subprocess.run(["systemctl", "is-active", "--quiet", UNIT]).returncode == 0
+
+
+def main():
+    last, same = None, 0
+    while True:
+        want = at_login_screen()
+        same = same + 1 if want == last else 1
+        last = want
+        if same == 2:  # the same answer twice in a row: not a momentary hand-over
+            running = unit_active()
+            if want and not running:
+                print("login screen showing: starting login-screen streaming")
+                subprocess.run([WAKE])
+                subprocess.run(["systemctl", "start", "--no-block", UNIT])
+            elif not want and running:
+                print("desktop logged in: handing streaming back to the desktop")
+                subprocess.run(["systemctl", "stop", UNIT])
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -24,10 +24,13 @@ and 120 Hz. **Lightpath Steam** goes straight to Steam Big Picture.
 Press **Ctrl+Option+Shift+Q** to stop. **Ctrl+Option+Shift+S** shows live performance stats.
 
 **It behaves like a Mac.** Your usual shortcuts work on the PC (Cmd+C / Cmd+V, Cmd+Z, Cmd+Tab,
-Cmd+Space to search, Cmd+Left/Right, Option+arrows to jump words, Cmd+Q to quit an app), copy
+tap Cmd alone for the Activities overview (the PC's Super key), Cmd+Space to search, Cmd+Left/Right, Option+arrows to jump words, Cmd+Q to quit an app), copy
 and paste works between the Mac and the PC in both directions (text and pictures), and the
 trackpad scrolls, pinches to zoom and swipes back/forward the way it does on the Mac. Swipe
 between spaces (or Cmd+Tab out of full screen with Ctrl+Option+Shift+Z first) to get back to the Mac.
+
+**Logged out?** Connect anyway: you see the PC's login screen, type your password, and the
+stream follows you to the desktop by itself.
 
 In Terminal, `lightpath status` shows how the PC is reachable and how fast the link is;
 `lightpath wake` just wakes it.
@@ -40,7 +43,8 @@ In Terminal, `lightpath status` shows how the PC is reachable and how fast the l
 |---|---|
 | **Virtual display matched to the client** (`capture = mutter`) | For every stream GNOME creates a monitor with exactly the Mac's resolution and refresh rate (3024x1890 @ 120 Hz on a 14" MacBook Pro), makes it the only display, captures it zero-copy (DMA-BUF into NVENC) and removes it afterwards, restoring the projector/monitor. No scaling anywhere, frames come from a 120 Hz compositor clock and are encoded the instant they're rendered. |
 | **NVENC split-frame encoding on Linux** | Upstream only offers it on Windows. On GPUs with two NVENC engines (RTX 4090) each frame is encoded as two halves in parallel: **3.6 → 2.2 ms per frame**. |
-| **Mac shortcuts on the PC** (`src/mac_keymap.h`) | For Mac clients only, Cmd+key becomes Ctrl+key, Cmd+click Ctrl+click, Cmd+Tab/Cmd+\` the window switcher, Cmd+Space search, Cmd+arrows line/document edges, Cmd+Backspace delete-to-line-start, Cmd+[ / ] back/forward, Cmd+H/M hide, Option+arrows/Backspace/Delete whole words. Host modifiers are always pressed before stale ones are released, so no app ever sees a stray Alt tap; a randomized stress test proves no key is ever left stuck. |
+| **Mac shortcuts on the PC** (`src/mac_keymap.h`) | For Mac clients only, Cmd+key becomes Ctrl+key, Cmd+click Ctrl+click, Cmd+Tab/Cmd+\` the window switcher, Cmd tapped alone Super (Activities), Cmd+Space search, Cmd+arrows line/document edges, Cmd+Backspace delete-to-line-start, Cmd+[ / ] back/forward, Cmd+H/M hide, Option+arrows/Backspace/Delete whole words. Host modifiers are always pressed before stale ones are released, so no app ever sees a stray Alt tap; a randomized stress test proves no key is ever left stuck. |
+| **Login-screen streaming** (`host/greeter/`) | After a logout or a desktop crash the desktop Sunshine is gone with the session. A watcher runs a second Sunshine (root, KMS capture straight from the GPU, same identity and paired devices) only while the GDM login screen shows, wakes the login screen if it blanked, and hands the ports back the moment a desktop logs in; the Mac follows to the desktop automatically. The desktop Sunshine is tied to the desktop session, so it always starts fresh with the new login. |
 | **Sound back on your speakers** (agent) | While streaming, Sunshine sends the PC's sound to the Mac through its own virtual output. The agent remembers the output you last picked and puts sound back on it whenever no stream is running, even if Sunshine's own switch-back fails or the projector's HDMI output vanished during the stream. |
 | **Shared clipboard** (`/lightpath/clipboard`) | Copy on the Mac, paste on the PC and the other way round: text and PNG images up to 16 MB, through GNOME's own remote-desktop clipboard API, over the paired client-certificate HTTPS channel. Syncs the moment you switch between the stream and a Mac app; nothing polls. |
 | **Trackpad-quality scrolling** | Mac trackpad deltas are injected as real touchpad scrolling in logical pixels (GNOME remote-desktop API), so content follows the fingers 1:1 with the Mac's own inertia, instead of being turned into mouse-wheel notches. |

@@ -1,0 +1,12 @@
+{
+  "env": {},
+  "apps": [
+    {
+      "name": "Desktop",
+      "image-path": "desktop.png",
+      "prep-cmd": [
+        {"do": "/usr/local/libexec/lightpath/greeter-wake", "undo": ""}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+#!/bin/bash
+# Turn the login screen back on if it blanked itself, so the stream has a picture.
+# Runs as root; talks to the login screen's own compositor on its session bus.
+for s in $(loginctl list-sessions --no-legend | awk '{print $1}'); do
+    [ "$(loginctl show-session "$s" -p Class --value 2>/dev/null)" = greeter ] || continue
+    u="$(loginctl show-session "$s" -p Name --value)"
+    uid="$(id -u "$u")" || continue
+    runuser -u "$u" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+        busctl --user set-property org.gnome.Mutter.DisplayConfig /org/gnome/Mutter/DisplayConfig \
+        org.gnome.Mutter.DisplayConfig PowerSaveMode i 0 2>/dev/null
+done
+sleep 0.5
+exit 0

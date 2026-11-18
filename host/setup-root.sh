@@ -12,7 +12,7 @@
 #   3. Enables tailscaled and lets <username> control it without sudo.
 #   4. Loads uinput at boot (virtual keyboard/mouse/gamepads for the stream).
 #   5. Applies network sysctls sized for 100+ Mbps video bursts.
-#   6. Logs the desktop back in by itself after a logout (GDM timed login).
+#   6. Streams the login screen while nobody is logged in (type the password from the Mac).
 set -euo pipefail
 
 TARGET_USER="${1:-${SUDO_USER:-}}"
@@ -100,12 +100,24 @@ net.core.netdev_max_backlog = 16384
 EOF
 sysctl --system >/dev/null
 
-log "Root setup done."
-
-# --------------------------------------------------------------------------- 6. log back in after logout
-# Streaming needs a logged-in desktop. GDM's automatic login only happens at boot, so after a
-# logout the PC would sit at the login screen and the Mac could not connect. A timed login logs
-# the user back in 10 s after the login screen appears (still lets someone pick another account).
-if [[ -f /etc/gdm/custom.conf ]] && ! grep -q '^TimedLoginEnable' /etc/gdm/custom.conf; then
-  sed -i "/^\[daemon\]/a TimedLoginEnable=True\nTimedLogin=${SUDO_USER:-$USER}\nTimedLoginDelay=10" /etc/gdm/custom.conf
+# --------------------------------------------------------------------------- 6. stream the login screen
+# After a logout (or a desktop crash) the PC shows the GDM login screen and the desktop Sunshine
+# is gone. A second Sunshine runs only while that login screen shows, reading the screen straight
+# from the graphics card, so the Mac can still connect and type the password. Once the desktop
+# is back it hands over to the desktop Sunshine.
+GREETER_SRC="$(cd "$(dirname "$0")" && pwd)/greeter"
+LIBEXEC_LP=/usr/local/libexec/lightpath
+install -d "$LIBEXEC_LP" /etc/lightpath/greeter
+install -m 755 "$GREETER_SRC"/greeter-wake "$GREETER_SRC"/greeter-sync "$GREETER_SRC"/lightpath-greeter-watch "$LIBEXEC_LP/"
+install -m 644 "$GREETER_SRC"/sunshine.conf "$GREETER_SRC"/apps.json /etc/lightpath/greeter/
+printf '%s\n' "${SUDO_USER:-$USER}" > /etc/lightpath/greeter/user
+install -m 644 "$GREETER_SRC"/lightpath-greeter.service "$GREETER_SRC"/lightpath-greeter-watch.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now lightpath-greeter-watch.service
+# Earlier versions logged back in by themselves (timed login); the login screen is reachable
+# from the Mac now, so the password stays required.
+if [[ -f /etc/gdm/custom.conf ]]; then
+  sed -i '/^TimedLogin\(Enable\)\?=/d; /^TimedLoginDelay=/d' /etc/gdm/custom.conf
 fi
+
+log "Root setup done."

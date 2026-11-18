@@ -248,6 +248,24 @@ def sunshine_name():
     return socket.gethostname()
 
 
+def screen_state():
+    """What a Mac connecting now would see: "desktop" (logged in and the desktop Sunshine is
+    listening), "login" (the GDM login screen, streamed by lightpath-greeter) or "starting"."""
+    def prop(kind, name, key):
+        r = subprocess.run(["loginctl", f"show-{kind}", name, "-p", key, "--value"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    try:
+        active = prop("seat", "seat0", "ActiveSession")
+        if not active or prop("session", active, "Class") != "user":
+            return "login"
+        listening = subprocess.run(["ss", "-Hltn", f"sport = :{SUNSHINE_PORT}"],
+                                   capture_output=True, text=True, timeout=5).stdout.strip()
+        return "desktop" if listening else "starting"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 def status():
     return {
         "name": socket.gethostname(),
@@ -256,6 +274,7 @@ def status():
         "lan": lan_info(),
         "tailscale": tailscale_info(),
         "streaming": stream_active(),
+        "screen": screen_state(),
         "wake_relay": wake_relay(),
         "time": int(time.time()),
     }
